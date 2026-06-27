@@ -949,7 +949,7 @@ generate_ss2022_password() {
 # =============================================================================
 
 generate_keys_and_ids() {
-  UUID="$(generate_uuid_v4)"
+  UUID="${UUID:-$(generate_uuid_v4)}"
   XHTTP_PATH=""
   SHORT_ID="$(openssl rand -hex 8)"
 
@@ -969,6 +969,53 @@ generate_keys_and_ids() {
     echo "$keys"
     exit 1
   fi
+}
+
+detect_existing_common_uuid() {
+  local candidate
+  for candidate in "${UUID:-}" "${ARGO_UUID:-}" "${VMESS_UUID:-}" "${TUIC_UUID:-}"; do
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+sync_common_uuid() {
+  ARGO_UUID="$UUID"
+  VMESS_UUID="$UUID"
+  TUIC_UUID="$UUID"
+}
+
+read_common_uuid() {
+  local input_uuid
+  read -r -p "请输入通用 UUID (留空则自动生成): " input_uuid
+  if [[ -z "$input_uuid" ]]; then
+    UUID="$(generate_uuid_v4)"
+    echo "已生成随机 UUID: $UUID"
+  else
+    UUID="$input_uuid"
+  fi
+  sync_common_uuid
+}
+
+prompt_common_uuid() {
+  local previous_uuid use_previous
+
+  previous_uuid="$(detect_existing_common_uuid 2>/dev/null || true)"
+  if [[ -n "$previous_uuid" ]]; then
+    echo "检测到之前节点使用的 UUID: $previous_uuid"
+    read -r -p "是否继续使用该 UUID? [Y/n]: " use_previous
+    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
+      UUID="$previous_uuid"
+      sync_common_uuid
+      echo "已继续使用历史 UUID: $UUID"
+      return 0
+    fi
+  fi
+
+  read_common_uuid
 }
 
 write_sing_box_service() {
@@ -3848,17 +3895,7 @@ do_one_click_all() {
   cyan "================ 一键生成所有标准协议 ================"
   
   # 1. 引导获取 UUID
-  read -r -p "请输入通用 UUID (留空则自动生成): " input_uuid
-  if [[ -z "$input_uuid" ]]; then
-    UUID="$(generate_uuid_v4)"
-    echo "已生成随机 UUID: $UUID"
-  else
-    UUID="$input_uuid"
-  fi
-  # 将核心 UUID 同步给下级协议使用
-  ARGO_UUID="$UUID"
-  VMESS_UUID="$UUID"
-  TUIC_UUID="$UUID"
+  prompt_common_uuid
 
   # 2. 引导获取必要协议的端口
   echo ""
