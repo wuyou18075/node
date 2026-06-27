@@ -10,7 +10,7 @@
 
 # 基础环境变量
 APP_NAME="AGSB-Standalone"
-APP_VERSION="1.0.4"
+APP_VERSION="1.0.5"
 SING_BOX_BIN="/usr/local/bin/sing-box"
 SING_BOX_VERSION=""  # 由 detect_sing_box_version() 自动检测填充
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
@@ -31,6 +31,7 @@ NGINX_SITE_CONF="/etc/nginx/conf.d/agsb-edupanel.conf"
 ARGO_BOOT_LOG="/var/log/cloudflared.log"
 SUBSCRIPTION_DIR="/var/www/subscription"
 INSTALL_SCRIPT="$(realpath "$0")"
+MASK_SITE_SCRIPT_URL="${MASK_SITE_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/mask-site.sh}"
 
 # 颜色输出
 red() { printf '\e[31m%s\e[0m\n' "$*"; }
@@ -512,25 +513,25 @@ configure_domain_certificate() {
 
 install_mask_site_nginx() {
   require_root || return 1
-  local script_dir site_script
-  script_dir="$(cd "$(dirname "$INSTALL_SCRIPT")" && pwd)"
-  site_script="${script_dir}/mask-site.sh"
-  if [[ ! -f "$site_script" ]]; then
-    red "未找到独立站点脚本：${site_script}"
-    return 1
-  fi
-  bash "$site_script" deploy
+  run_remote_mask_site_script deploy
 }
 
 refresh_mask_site_nginx() {
-  local script_dir site_script
-  script_dir="$(cd "$(dirname "$INSTALL_SCRIPT")" && pwd)"
-  site_script="${script_dir}/mask-site.sh"
-  if [[ ! -f "$site_script" ]]; then
-    red "未找到独立站点脚本：${site_script}"
-    return 1
-  fi
-  bash "$site_script" refresh-nginx
+  run_remote_mask_site_script refresh-nginx
+}
+
+mask_site_script_fetch_url() {
+  local sep="?"
+  [[ "$MASK_SITE_SCRIPT_URL" == *\?* ]] && sep="&"
+  printf '%s%s_t=%s\n' "$MASK_SITE_SCRIPT_URL" "$sep" "${RANDOM}${RANDOM}"
+}
+
+run_remote_mask_site_script() {
+  local action="$1" url
+  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法拉取远程站点脚本。"; return 1; }
+  url="$(mask_site_script_fetch_url)"
+  yellow "正在从远程加载站点脚本：${MASK_SITE_SCRIPT_URL}"
+  (set -o pipefail; curl -fsSL -H "Cache-Control: no-cache" "$url" | bash -s -- "$action")
 }
 clear_hy2_port_hopping_rules() { :; }
 apply_hy2_port_hopping_rules() { :; }
