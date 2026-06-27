@@ -1018,6 +1018,47 @@ prompt_common_uuid() {
   read_common_uuid
 }
 
+is_valid_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 ))
+}
+
+read_subscription_port() {
+  local input_port
+
+  while :; do
+    read -r -p "请输入订阅链接端口 (留空随机 50000-60000): " input_port
+    if [[ -z "$input_port" ]]; then
+      pick_subscription_port || SUB_PORT="$(shuf -i 50000-60000 -n 1)"
+      echo "已自动生成订阅链接端口: $SUB_PORT"
+      return 0
+    fi
+    if is_valid_port "$input_port"; then
+      SUB_PORT="$input_port"
+      return 0
+    fi
+    red "端口无效，请输入 1-65535 的数字。"
+  done
+}
+
+prompt_subscription_port() {
+  local previous_port use_previous
+
+  previous_port="${SUB_PORT:-}"
+  if is_valid_port "$previous_port"; then
+    echo "检测到之前生成的订阅链接端口: $previous_port"
+    read -r -p "是否继续使用该端口? [Y/n]: " use_previous
+    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
+      SUB_PORT="$previous_port"
+      echo "已继续使用订阅链接端口: $SUB_PORT"
+      return 0
+    fi
+  fi
+
+  read_subscription_port
+}
+
 write_sing_box_service() {
   printf '%s\n' \
     "[Unit]" \
@@ -4085,7 +4126,7 @@ do_one_click_all() {
   build_argo_share_files "0" || true
 
   echo "部署智能订阅服务..."
-  pick_subscription_port || SUB_PORT="$(shuf -i 50000-60000 -n 1)"
+  prompt_subscription_port
   generate_subscription_path
   install_subscription_service || true
 
