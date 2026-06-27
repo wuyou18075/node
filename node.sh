@@ -10,7 +10,7 @@
 
 # 基础环境变量
 APP_NAME="AGSB-Standalone"
-APP_VERSION="1.0.5"
+APP_VERSION="1.0.6"
 SING_BOX_BIN="/usr/local/bin/sing-box"
 SING_BOX_VERSION=""  # 由 detect_sing_box_version() 自动检测填充
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
@@ -527,11 +527,20 @@ mask_site_script_fetch_url() {
 }
 
 run_remote_mask_site_script() {
-  local action="$1" url
+  local action="$1" tmp_script url rc
   command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法拉取远程站点脚本。"; return 1; }
   url="$(mask_site_script_fetch_url)"
   yellow "正在从远程加载站点脚本：${MASK_SITE_SCRIPT_URL}"
-  (set -o pipefail; curl -fsSL -H "Cache-Control: no-cache" "$url" | bash -s -- "$action")
+  tmp_script="$(mktemp /tmp/mask-site.XXXXXX.sh)" || return 1
+  if ! curl -fsSL -H "Cache-Control: no-cache" "$url" -o "$tmp_script"; then
+    rm -f "$tmp_script"
+    red "远程站点脚本下载失败：${MASK_SITE_SCRIPT_URL}"
+    return 1
+  fi
+  bash "$tmp_script" "$action"
+  rc=$?
+  rm -f "$tmp_script"
+  return "$rc"
 }
 clear_hy2_port_hopping_rules() { :; }
 apply_hy2_port_hopping_rules() { :; }
