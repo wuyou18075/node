@@ -4762,6 +4762,313 @@ uninstall_all() {
   green "卸载完成，sing-box 服务和二进制已清理。"
 }
 
+do_one_click_all_with_cdn() {
+  clear
+  load_state >/dev/null 2>&1 || true
+  cyan "================ 一键全协议 + CDN 加速 ================"
+
+  # ===== 第1步: UUID =====
+  prompt_common_uuid
+
+  # ===== 第2步: 全局 CF Token =====
+  echo ""
+  cyan "--- Cloudflare API Token (全局) ---"
+  echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS/Origin Rules"
+  read -r -p "请输入 Cloudflare API Token: " _global_cf_token
+  _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -z "$_global_cf_token" ]]; then
+    red "API Token 不能为空。"
+    return 1
+  fi
+  CF_API_TOKEN="$_global_cf_token"
+  local token_len="${#_global_cf_token}"
+  local token_tail="$_global_cf_token"
+  if (( token_len > 6 )); then
+    token_tail="${_global_cf_token: -6}"
+  fi
+  echo "Token 已读取: 长度 ${token_len}，结尾 ${token_tail}"
+
+  # ===== 第3步: 端口分配（7个协议: HY2/SS/VMess/TUIC/AnyTLS/VLESS + CDN-VMess） =====
+  echo ""
+  echo "本次安装将包含以下 7 个需要端口的协议:"
+  echo "1.Hysteria2 2.SS-2022 3.VMess 4.TUIC 5.AnyTLS 6.VLESS 7.CDN-VMess"
+  read -r -p "请依次输入 7 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
+
+  if [[ -z "$custom_ports" ]]; then
+    local _used_ports=() _p
+    for _proto in HY2 SS2022 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
+      while :; do
+        _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+        [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
+      done
+      _used_ports+=("$_p")
+      case "$_proto" in
+        HY2) HY2_PORT="$_p" ;;
+        SS2022) SS2022_PORT="$_p" ;;
+        VMESS) VMESS_PORT="$_p" ;;
+        TUIC) TUIC_PORT="$_p" ;;
+        ANYTLS) ANYTLS_PORT="$_p" ;;
+        VLESS) VLESS_PORT="$_p" ;;
+        CDN_VMESS) CDN_VMESS_PORT="$_p" ;;
+      esac
+    done
+    echo "已自动生成端口: HY2=$HY2_PORT SS=$SS2022_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT CDN-VMess=$CDN_VMESS_PORT"
+  else
+    IFS=',' read -r -a port_array <<< "$custom_ports"
+    HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    SS2022_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[5]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    CDN_VMESS_PORT="${port_array[6]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+  fi
+
+  # 端口去重和冲突检测
+  local _used_ports=() _port_var _port_val _new_port
+  for _port_var in HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
+    _port_val="${!_port_var:-}"
+    if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
+      _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+      printf -v "$_port_var" '%s' "$_new_port"
+      _port_val="$_new_port"
+    fi
+    _used_ports+=("$_port_val")
+  done
+
+  # ===== 第4步: 域名和证书 =====
+  echo ""
+  configure_domain_certificate
+
+  # ===== 第5步: 节点名前缀 =====
+  echo ""
+  read -r -p "请输入节点名前缀 (留空使用主机名 $(hostname)): " node_prefix
+  node_prefix="${node_prefix:-$(hostname)}"
+
+  NODE_NAME_VLESS="${node_prefix}-VLESS"
+  NODE_NAME_HY2="${node_prefix}-HY2"
+  NODE_NAME_SS2022="${node_prefix}-SS2022"
+  NODE_NAME_VMESS="${node_prefix}-VMess"
+  NODE_NAME_TUIC="${node_prefix}-TUIC"
+  NODE_NAME_ARGO="${node_prefix}-Argo"
+  NODE_NAME_ANYTLS="${node_prefix}-AnyTLS"
+  NODE_NAME_CDN_VMESS="${node_prefix}-CDN"
+
+  # ===== 第6步: Argo 隧道域名 =====
+  echo ""
+  cyan "--- Argo 隧道配置 ---"
+  echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
+  echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
+  read -r -p "请输入 Argo 隧道域名 (如 tunnel.example.com): " argo_domain_input
+  argo_domain_input="$(printf '%s' "${argo_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+
+  if [[ "$argo_domain_input" == "0" ]]; then
+    yellow "跳过 Argo 隧道。"
+    ARGO_ENABLED="0"
+  elif [[ -n "$argo_domain_input" ]]; then
+    ARGO_FIXED_DOMAIN="$argo_domain_input"
+    ARGO_TUNNEL_MODE="named"
+    ARGO_DOMAIN="$ARGO_FIXED_DOMAIN"
+    pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
+    echo "隧道域名: ${ARGO_FIXED_DOMAIN}  本地端口: ${ARGO_LOCAL_PORT}"
+    if ! cf_configure_named_tunnel; then
+      red "Argo Named Tunnel 配置失败，将跳过 Argo。"
+      ARGO_ENABLED="0"
+    else
+      ARGO_ENABLED="1"
+    fi
+  else
+    yellow "未输入域名，使用临时隧道。"
+    ARGO_TUNNEL_MODE="quick"
+    ARGO_FIXED_DOMAIN=""
+    ARGO_TUNNEL_TOKEN=""
+    ARGO_DOMAIN=""
+    pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
+    ARGO_ENABLED="1"
+  fi
+
+  # ===== 第7步: CDN 加速域名 =====
+  echo ""
+  cyan "--- CDN+VMess+WS 配置 ---"
+  read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
+  cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+  if [[ -z "$cdn_domain_input" ]]; then
+    red "CDN 域名不能为空。"
+    return 1
+  fi
+
+  echo ""
+  echo "CDN 端口模式:"
+  echo "  A) CF 标准 HTTP 端口 (无需 Origin Rules)"
+  echo "  B) 自定义端口 ${CDN_VMESS_PORT} (需要 Origin Rules 权限)"
+  read -r -p "请选择 [A/B，默认 A]: " cdn_port_mode
+  cdn_port_mode="$(printf '%s' "${cdn_port_mode:-A}" | tr '[:lower:]' '[:upper:]')"
+
+  local cdn_need_origin_rule="0"
+  if [[ "$cdn_port_mode" == "B" ]]; then
+    cdn_need_origin_rule="1"
+  else
+    echo "可用 CF 标准 HTTP 端口: 80, 8080, 8880, 2052, 2082, 2086, 2095"
+    read -r -p "选择端口 [默认 8880]: " cdn_std_port
+    CDN_VMESS_PORT="${cdn_std_port:-8880}"
+    if ! cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+      red "端口 ${CDN_VMESS_PORT} 不是 CF 标准 HTTP 端口。"
+      return 1
+    fi
+  fi
+
+  # ===== 开始部署 =====
+  echo ""
+  cyan "===== 开始部署所有协议 ====="
+
+  # 生成密码
+  SHARED_PASS="$(openssl rand -hex 12)"
+  HY2_PASSWORD="$SHARED_PASS"
+  SS2022_PASSWORD="$SHARED_PASS"
+  TUIC_PASSWORD="$SHARED_PASS"
+  ANYTLS_PASSWORD="$SHARED_PASS"
+
+  SS2022_CIPHER="2022-blake3-aes-128-gcm"
+  ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
+  VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
+  CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
+
+  if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
+    VMESS_VIA_NGINX="1"
+  else
+    VMESS_VIA_NGINX="0"
+  fi
+  HY2_PORT_RANGE=""
+  HY2_OBFS_ENABLED="0"
+  HY2_OBFS_PASSWORD=""
+  select_argo_edge_server
+
+  HY2_ENABLED="1"
+  VLESS_ENABLED="1"
+  ANYTLS_ENABLED="1"
+  SS2022_ENABLED="1"
+  VMESS_ENABLED="1"
+  TUIC_ENABLED="1"
+  CDN_VMESS_ENABLED="1"
+
+  HY2_TLS_SNI="$SNI_VAL"
+  TUIC_TLS_SNI="$SNI_VAL"
+  if [[ "${VMESS_VIA_NGINX:-0}" == "1" ]]; then
+    VMESS_TLS_ENABLED="0"
+    VMESS_TLS_SNI=""
+  else
+    VMESS_TLS_ENABLED="1"
+    VMESS_TLS_SNI="$SNI_VAL"
+  fi
+  ANYTLS_TLS_SNI="$SNI_VAL"
+
+  TARGET_PORT="443"
+  HANDSHAKE_SERVER="${HANDSHAKE_SERVER:-$REALITY_SNI}"
+  HANDSHAKE_PORT="443"
+
+  # VPS IP
+  local vps_ip
+  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  if [[ -z "$vps_ip" ]]; then
+    read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
+    [[ -n "$vps_ip" ]] || { red "VPS IP 不能为空。"; return 1; }
+  fi
+
+  # server_addr
+  VMESS_SERVER_ADDR="${vps_ip}"
+  SS2022_SERVER_ADDR="${vps_ip}"
+  HY2_SERVER_ADDR="${vps_ip}"
+  TUIC_SERVER_ADDR="${vps_ip}"
+  ANYTLS_SERVER_ADDR="${vps_ip}"
+  CDN_VMESS_UUID="${UUID}"
+  CDN_VMESS_CDN_DOMAIN="$cdn_domain_input"
+  CDN_VMESS_SERVER_ADDR="${vps_ip}"
+  CDN_VMESS_ORIGIN_PORT="$CDN_VMESS_PORT"
+
+  # 生成 VLESS Reality 密钥对
+  echo "正在生成 sing-box VLESS Reality 密钥对..."
+  generate_keys_and_ids || true
+
+  # CDN DNS + Origin Rules 配置
+  echo ""
+  echo "正在配置 CDN+VMess+WS 的 Cloudflare DNS..."
+  if ! cf_configure_cdn_vmess "$cdn_domain_input" "$CDN_VMESS_PORT" "$vps_ip" "$cdn_need_origin_rule"; then
+    yellow "CDN 配置失败，跳过 CDN+VMess+WS 节点。"
+    CDN_VMESS_ENABLED="0"
+  fi
+
+  # 写入 sing-box 配置（包含所有协议 + CDN VMess inbound）
+  echo "正在写入主配置并拉起核心代理服务..."
+  write_sing_box_config || return 1
+
+  if [[ "${VMESS_VIA_NGINX:-0}" == "1" ]]; then
+    echo "正在刷新 nginx 站点代理路径..."
+    save_state
+    refresh_mask_site_nginx || { red "nginx 代理路径刷新失败。"; return 1; }
+  fi
+
+  # Argo 隧道
+  if [[ "${ARGO_ENABLED:-0}" == "1" ]]; then
+    if argo_is_named_tunnel; then
+      echo "正在拉起 Cloudflare 固定隧道..."
+    else
+      echo "正在拉起 Cloudflare 临时隧道..."
+    fi
+    install_cloudflared_binary
+
+    pkill -f "wait-tcp 127.0.0.1" 2>/dev/null || true
+    pkill -f "tunnel.*--url.*cloudflared" 2>/dev/null || true
+    pkill -x agent 2>/dev/null || true
+    systemctl stop argo-refresh.timer argo-refresh.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+
+    generate_argo_identity
+    write_argo_service
+    systemctl daemon-reload
+    systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
+    enable_argo_refresh_automation
+    echo "正在启动 cloudflared..."
+    if systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1; then
+      if refresh_argo_domain 8; then
+        green "Argo 隧道启动成功！域名: ${ARGO_DOMAIN}"
+      else
+        yellow "Argo 已启动，暂未获取到域名。"
+      fi
+    else
+      red "Argo 隧道启动失败。"
+    fi
+  fi
+
+  # 构建所有分享文件
+  echo "正在构建全协议分享文件..."
+  build_client_files || true
+  build_hysteria2_share_files || true
+  build_ss2022_share_files || true
+  build_anytls_share_files || true
+  build_vmess_share_files || true
+  build_tuic_share_files || true
+  if [[ "${ARGO_ENABLED:-0}" == "1" ]]; then
+    build_argo_share_files "0" || true
+  fi
+  if [[ "${CDN_VMESS_ENABLED:-0}" == "1" ]]; then
+    build_cdn_vmess_share_files || true
+  fi
+
+  # 订阅服务
+  echo "部署智能订阅服务..."
+  prompt_subscription_port
+  generate_subscription_path
+  install_subscription_service || true
+
+  save_state
+
+  green "一键全协议 + CDN 安装完成！"
+  echo ""
+  show_node_info
+  echo "按任意键返回主菜单..."
+  read -r -n 1
+}
+
 create_node_submenu() {
   while true; do
     clear
@@ -4770,6 +5077,7 @@ create_node_submenu() {
     cyan "================================================="
     echo "  1) 一键生成所有标准协议 (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo)"
     echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
+    echo "  3) 一键全协议+CDN (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo/CDN)"
     echo "  0) 返回主菜单"
     cyan "================================================="
     read -r -p "请输入对应的数字: " sub_choice
@@ -4788,6 +5096,13 @@ create_node_submenu() {
         fi
         echo "按回车键返回..."
         read -r
+        ;;
+      3)
+        if ! do_one_click_all_with_cdn; then
+          red "一键全协议+CDN 安装失败。"
+          echo "按回车键返回..."
+          read -r
+        fi
         ;;
       0)
         return 0
