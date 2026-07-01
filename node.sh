@@ -660,10 +660,23 @@ cf_upsert_tunnel_dns() {
 
 cf_upsert_cdn_vmess_dns() {
   local cdn_domain="$1" vps_ip="$2" zone_id="$3"
-  local response record_id data
+  local response record_id record_type data conflict_ids
 
-  response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${cdn_domain}&type=A&per_page=100")" || return 1
-  record_id="$(printf '%s' "$response" | jq -r '.result[0].id // empty')"
+  # 查询该域名下所有类型的 DNS 记录
+  response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${cdn_domain}&per_page=100")" || return 1
+
+  # 删除所有冲突记录（CNAME、AAAA 等不能与 A 记录共存的类型）
+  conflict_ids="$(printf '%s' "$response" | jq -r '.result[]? | select(.type != "A" and .type != "TXT" and .type != "MX") | .id' 2>/dev/null)"
+  if [[ -n "$conflict_ids" ]]; then
+    local cid
+    for cid in $conflict_ids; do
+      yellow "删除冲突的 DNS 记录: ${cdn_domain} (id: ${cid})"
+      cf_api_request DELETE "/zones/${zone_id}/dns_records/${cid}" >/dev/null 2>&1 || true
+    done
+  fi
+
+  # 查找现有 A 记录
+  record_id="$(printf '%s' "$response" | jq -r '.result[]? | select(.type == "A") | .id' 2>/dev/null | head -1)"
   data="$(jq -nc --arg type "A" --arg name "$cdn_domain" --arg content "$vps_ip" \
     '{type:$type,name:$name,content:$content,ttl:1,proxied:true}')"
 
@@ -4795,7 +4808,6 @@ main_menu() {
     cyan "             节点配置与订阅管理面板"
     cyan "================================================="
 
-    # 获取 sing-box 状态、版本、最新版本
     local sb_status sb_ver sb_latest
     if [[ -x "$SING_BOX_BIN" ]]; then
       if systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
@@ -4871,7 +4883,7 @@ main_menu() {
         ;;
       99)
         echo ""
-        red "⚠ 警告：此操作将卸载 sing-box、所有节点配置和脚本创建的伪装站！"
+        red "警告：此操作将卸载 sing-box、所有节点配置和脚本创建的伪装站！"
         read -r -p "确认卸载? (请输入 YES 确认): " confirm
         if [[ "$confirm" != "YES" ]]; then
           yellow "已取消卸载。"
