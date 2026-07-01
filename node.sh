@@ -683,46 +683,64 @@ cf_set_origin_port_rule() {
 
   # 读取当前 http_config_settings phase 的 ruleset（可能不存在，404 是正常的）
   response="$(cf_api_request GET "$phase_endpoint" 2>/dev/null)" || response=""
-  existing_rules="$(printf '%s' "$response" | jq -c '.result.rules // []' 2>/dev/null)" || existing_rules="[]"
+  if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e '.result.rules' >/dev/null 2>&1; then
+    existing_rules="[]"
+  else
+    existing_rules="$(printf '%s' "$response" | jq -c '.result.rules // []')"
+  fi
 
-  # 构建新的 Origin Rule
+  # 构建新的 Origin Rule（用 --arg 传端口，jq 内 tonumber，避免 --argjson 空值问题）
   new_rule="$(jq -nc \
     --arg desc "CDN-VMess origin port: ${cdn_domain} -> ${origin_port}" \
     --arg expr "(http.host eq \"${cdn_domain}\")" \
-    --argjson port "$origin_port" \
+    --arg port "${origin_port}" \
     '{
       action: "route",
       expression: $expr,
       description: $desc,
       action_parameters: {
         origin: {
-          port: $port
+          port: ($port | tonumber)
         }
       }
     }')"
+
+  if [[ -z "$new_rule" ]]; then
+    red "构建 Origin Rule JSON 失败。"
+    return 1
+  fi
 
   # 检查是否已有相同域名的规则
   rule_exists="$(printf '%s' "$existing_rules" | jq --arg domain "$cdn_domain" \
     '[.[] | select(.expression | contains($domain))] | length' 2>/dev/null)" || rule_exists="0"
 
   if [[ "$rule_exists" -gt 0 ]]; then
-    # 替换同域名的旧规则，保留其他规则
-    merged_rules="$(printf '%s' "$existing_rules" | jq -c --arg domain "$cdn_domain" --argjson new "$new_rule" \
-      '[.[] | select(.expression | contains($domain) | not)] + [$new]')"
+    merged_rules="$(printf '%s' "$existing_rules" | jq -c --arg domain "$cdn_domain" \
+      '[.[] | select(.expression | contains($domain) | not)]')"
+    merged_rules="$(printf '%s\n%s' "$merged_rules" "$new_rule" | jq -sc '.[0] + [.[1]]')"
     yellow "更新 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
   else
-    # 追加新规则到现有规则列表
-    merged_rules="$(printf '%s' "$existing_rules" | jq -c --argjson new "$new_rule" '. + [$new]')"
+    merged_rules="$(printf '%s\n%s' "$existing_rules" "$new_rule" | jq -sc '.[0] + [.[1]]')"
     yellow "创建 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
   fi
 
-  # 统一用 PUT 到 phase entrypoint（无论是否已有 ruleset，PUT 都会创建或更新）
-  data="$(jq -nc --argjson rules "$merged_rules" '{rules:$rules}')"
+  data="$(printf '%s' "$merged_rules" | jq -c '{rules:.}')"
   cf_api_request PUT "$phase_endpoint" "$data" >/dev/null
 }
 
+# Cloudflare CDN 支持的 HTTP 回源端口（不需要 Origin Rules）
+CF_HTTP_PORTS=(80 8080 8880 2052 2082 2086 2095)
+
+cf_is_standard_http_port() {
+  local port="$1" p
+  for p in "${CF_HTTP_PORTS[@]}"; do
+    [[ "$port" == "$p" ]] && return 0
+  done
+  return 1
+}
+
 cf_configure_cdn_vmess() {
-  local cdn_domain="$1" origin_port="$2" vps_ip="$3"
+  local cdn_domain="$1" origin_port="$2" vps_ip="$3" need_origin_rule="$4"
 
   command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
   command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
@@ -735,13 +753,19 @@ cf_configure_cdn_vmess() {
   yellow "正在配置 DNS A 记录 (橙云代理)..."
   cf_upsert_cdn_vmess_dns "$cdn_domain" "$vps_ip" "$CDN_VMESS_CF_ZONE_ID" || return 1
 
-  yellow "正在配置 Origin Rules (端口回源)..."
-  cf_set_origin_port_rule "$cdn_domain" "$origin_port" "$CDN_VMESS_CF_ZONE_ID" || return 1
-
-  green "Cloudflare CDN VMess 配置完成。"
-  echo "域名: ${cdn_domain} (橙云代理已开启)"
-  echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
-  echo "Origin Rule: 客户端 -> ${cdn_domain}:443 -> CF CDN -> VPS:${origin_port}"
+  if [[ "$need_origin_rule" == "1" ]]; then
+    yellow "正在配置 Origin Rules (端口回源)..."
+    cf_set_origin_port_rule "$cdn_domain" "$origin_port" "$CDN_VMESS_CF_ZONE_ID" || return 1
+    green "Cloudflare CDN VMess 配置完成。"
+    echo "域名: ${cdn_domain} (橙云代理已开启)"
+    echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
+    echo "Origin Rule: 客户端 -> ${cdn_domain}:443 -> CF CDN -> VPS:${origin_port}"
+  else
+    green "Cloudflare CDN VMess 配置完成。"
+    echo "域名: ${cdn_domain} (橙云代理已开启)"
+    echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
+    echo "直连 CF 标准端口: 客户端 -> ${cdn_domain}:${origin_port} -> CF CDN -> VPS:${origin_port}"
+  fi
 }
 
 cf_configure_named_tunnel() {
@@ -2889,25 +2913,37 @@ build_argo_share_files() {
 # =============================================================================
 
 cdn_vmess_uri() {
-  local e_label
-  e_label="$(urlenc "$NODE_NAME_CDN_VMESS")"
-  printf 'vmess://%s' "$(echo -n '{"add":"'"${CDN_VMESS_CDN_DOMAIN}"'","aid":"0","host":"'"${CDN_VMESS_CDN_DOMAIN}"'","id":"'"${CDN_VMESS_UUID}"'","net":"ws","path":"'"${CDN_VMESS_WS_PATH}"'","port":"443","ps":"'"${NODE_NAME_CDN_VMESS}"'","tls":"tls","sni":"'"${CDN_VMESS_CDN_DOMAIN}"'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)"
+  local client_port
+  # 如果是 CF 标准 HTTP 端口，客户端直连该端口；否则客户端连 443 通过 Origin Rules 回源
+  if cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+    client_port="$CDN_VMESS_PORT"
+    # CF 标准 HTTP 端口不走 TLS
+    printf 'vmess://%s' "$(echo -n '{"add":"'"${CDN_VMESS_CDN_DOMAIN}"'","aid":"0","host":"'"${CDN_VMESS_CDN_DOMAIN}"'","id":"'"${CDN_VMESS_UUID}"'","net":"ws","path":"'"${CDN_VMESS_WS_PATH}"'","port":"'"${client_port}"'","ps":"'"${NODE_NAME_CDN_VMESS}"'","type":"none","v":"2"}' | base64 -w 0)"
+  else
+    client_port="443"
+    printf 'vmess://%s' "$(echo -n '{"add":"'"${CDN_VMESS_CDN_DOMAIN}"'","aid":"0","host":"'"${CDN_VMESS_CDN_DOMAIN}"'","id":"'"${CDN_VMESS_UUID}"'","net":"ws","path":"'"${CDN_VMESS_WS_PATH}"'","port":"'"${client_port}"'","ps":"'"${NODE_NAME_CDN_VMESS}"'","tls":"tls","sni":"'"${CDN_VMESS_CDN_DOMAIN}"'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)"
+  fi
 }
 
 build_cdn_vmess_share_files() {
-  local uri
+  local uri client_port
   ensure_node_info_dir
   uri="$(cdn_vmess_uri)"
+  if cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+    client_port="$CDN_VMESS_PORT"
+  else
+    client_port="443"
+  fi
 
   printf '%s\n' \
     "type: CDN+VMess+WS" \
     "cdnDomain: ${CDN_VMESS_CDN_DOMAIN}" \
-    "clientPort: 443 (CF CDN)" \
+    "clientPort: ${client_port}" \
     "originPort: ${CDN_VMESS_PORT} (VPS)" \
     "uuid: ${CDN_VMESS_UUID}" \
     "wsPath: ${CDN_VMESS_WS_PATH}" \
     "cfZone: ${CDN_VMESS_CF_ZONE_NAME:-unknown}" \
-    "note: 客户端连接 ${CDN_VMESS_CDN_DOMAIN}:443，经 CF CDN 加速回源至 VPS:${CDN_VMESS_PORT}" \
+    "note: 客户端连接 ${CDN_VMESS_CDN_DOMAIN}:${client_port}，经 CF CDN 加速回源至 VPS:${CDN_VMESS_PORT}" \
     "" \
     "=== CDN VMess-WS URI ===" \
     "$uri" > "$CDN_VMESS_SHARE_TXT"
@@ -2921,15 +2957,29 @@ build_cdn_vmess_share_files() {
 }
 
 install_cdn_vmess_core() {
-  local cdn_domain api_token input_port vps_ip
+  local cdn_domain api_token input_port vps_ip port_mode need_origin_rule
 
   echo ""
   cyan "=== CDN+VMess+WS 节点安装 ==="
   echo "此模式通过 Cloudflare CDN 加速 VMess+WS 流量。"
-  echo "客户端连接 CDN域名:443 → CF CDN → 回源到 VPS 自定义端口。"
+  echo ""
+  echo "端口模式说明："
+  echo "  A) CF 标准 HTTP 端口 (80/8080/8880/2052/2082/2086/2095)"
+  echo "     无需 Origin Rules，Token 只需 DNS 编辑权限即可"
+  echo "     客户端直连 CDN域名:端口 → CF CDN → VPS:端口"
+  echo ""
+  echo "  B) 自定义端口 (需要 Origin Rules 权限)"
+  echo "     客户端连 CDN域名:443 → CF Origin Rule 回源 → VPS:自定义端口"
   echo ""
 
-  # 1. 获取 CF API Token
+  # 1. 选择端口模式
+  read -r -p "请选择端口模式 [A=标准端口(推荐) / B=自定义端口]: " port_mode
+  port_mode="$(printf '%s' "$port_mode" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$port_mode" != "B" ]]; then
+    port_mode="A"
+  fi
+
+  # 2. 获取 CF API Token
   read -r -p "请输入 Cloudflare API Token: " api_token
   api_token="$(printf '%s' "$api_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   if [[ -z "$api_token" ]]; then
@@ -2938,7 +2988,7 @@ install_cdn_vmess_core() {
   fi
   CF_API_TOKEN="$api_token"
 
-  # 2. 获取 CDN 加速域名
+  # 3. 获取 CDN 加速域名
   read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain
   cdn_domain="$(printf '%s' "$cdn_domain" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
   if [[ -z "$cdn_domain" ]]; then
@@ -2946,19 +2996,33 @@ install_cdn_vmess_core() {
     return 1
   fi
 
-  # 3. 获取回源端口
-  read -r -p "请输入 VPS 回源端口 (留空随机 50000-60000): " input_port
-  if [[ -z "$input_port" ]]; then
-    CDN_VMESS_PORT="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
-    echo "已自动分配回源端口: ${CDN_VMESS_PORT}"
-  elif [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
+  # 4. 获取端口
+  need_origin_rule="0"
+  if [[ "$port_mode" == "A" ]]; then
+    echo ""
+    echo "可用的 CF 标准 HTTP 端口: 80, 8080, 8880, 2052, 2082, 2086, 2095"
+    read -r -p "请选择端口 [默认 8880]: " input_port
+    input_port="${input_port:-8880}"
+    if ! cf_is_standard_http_port "$input_port"; then
+      red "端口 ${input_port} 不是 CF 标准 HTTP 端口。"
+      return 1
+    fi
     CDN_VMESS_PORT="$input_port"
   else
-    red "端口无效。"
-    return 1
+    read -r -p "请输入 VPS 回源端口 (留空随机 50000-60000): " input_port
+    if [[ -z "$input_port" ]]; then
+      CDN_VMESS_PORT="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+      echo "已自动分配回源端口: ${CDN_VMESS_PORT}"
+    elif [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
+      CDN_VMESS_PORT="$input_port"
+    else
+      red "端口无效。"
+      return 1
+    fi
+    need_origin_rule="1"
   fi
 
-  # 4. 检测 VPS 公网 IP
+  # 5. 检测 VPS 公网 IP
   vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
   if [[ -z "$vps_ip" ]]; then
     read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
@@ -2966,33 +3030,42 @@ install_cdn_vmess_core() {
   fi
   echo "VPS 公网 IP: ${vps_ip}"
 
-  # 5. 生成 VMess 身份
+  # 6. 生成 VMess 身份
   CDN_VMESS_UUID="${UUID:-$(generate_uuid_v4)}"
   CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
   CDN_VMESS_CDN_DOMAIN="$cdn_domain"
   CDN_VMESS_SERVER_ADDR="$vps_ip"
   CDN_VMESS_ORIGIN_PORT="$CDN_VMESS_PORT"
 
-  # 6. 调用 CF API 配置
+  # 7. 调用 CF API 配置
   echo ""
-  if ! cf_configure_cdn_vmess "$cdn_domain" "$CDN_VMESS_PORT" "$vps_ip"; then
+  if ! cf_configure_cdn_vmess "$cdn_domain" "$CDN_VMESS_PORT" "$vps_ip" "$need_origin_rule"; then
     red "Cloudflare CDN 配置失败。"
     return 1
   fi
 
-  # 7. 安装 sing-box 并写入配置
+  # 8. 安装 sing-box 并写入配置
   install_sing_box
   CDN_VMESS_ENABLED="1"
   write_sing_box_config || { red "sing-box 配置写入失败。"; return 1; }
 
-  # 8. 构建分享文件
+  # 9. 构建分享文件
   build_cdn_vmess_share_files
 
   save_state
 
-  green "CDN+VMess+WS 节点安装成功！"
-  echo ""
-  echo "连接方式: 客户端 → ${cdn_domain}:443 (TLS) → CF CDN → VPS:${CDN_VMESS_PORT} (HTTP)"
+  local client_port
+  if cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+    client_port="$CDN_VMESS_PORT"
+    green "CDN+VMess+WS 节点安装成功！"
+    echo ""
+    echo "连接方式: 客户端 → ${cdn_domain}:${client_port} (HTTP) → CF CDN → VPS:${CDN_VMESS_PORT} (HTTP)"
+  else
+    client_port="443"
+    green "CDN+VMess+WS 节点安装成功！"
+    echo ""
+    echo "连接方式: 客户端 → ${cdn_domain}:443 (TLS) → CF CDN (Origin Rule) → VPS:${CDN_VMESS_PORT} (HTTP)"
+  fi
   echo ""
   echo "[CDN VMess-WS URI]"
   cdn_vmess_uri
@@ -3609,25 +3682,44 @@ build_subscription_clash_yaml() {
   if has_cdn_vmess_install; then
     name="$NODE_NAME_CDN_VMESS"
     proxies+=("$name")
-    printf '%s\n' \
-      "  - name: $(yaml_quote "$name")" \
-      "    type: vmess" \
-      "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
-      "    port: 443" \
-      "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
-      "    alterId: 0" \
-      "    cipher: auto" \
-      "    network: ws" \
-      "    tls: true" \
-      "    udp: true" \
-      "    ip-version: ipv4-prefer" \
-      "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
-      "    client-fingerprint: chrome" \
-      "    skip-cert-verify: false" \
-      "    ws-opts:" \
-      "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
-      "      headers:" \
-      "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_YAML"
+    if cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+      printf '%s\n' \
+        "  - name: $(yaml_quote "$name")" \
+        "    type: vmess" \
+        "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    port: ${CDN_VMESS_PORT}" \
+        "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+        "    alterId: 0" \
+        "    cipher: auto" \
+        "    network: ws" \
+        "    tls: false" \
+        "    udp: true" \
+        "    ip-version: ipv4-prefer" \
+        "    ws-opts:" \
+        "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+        "      headers:" \
+        "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_YAML"
+    else
+      printf '%s\n' \
+        "  - name: $(yaml_quote "$name")" \
+        "    type: vmess" \
+        "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    port: 443" \
+        "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+        "    alterId: 0" \
+        "    cipher: auto" \
+        "    network: ws" \
+        "    tls: true" \
+        "    udp: true" \
+        "    ip-version: ipv4-prefer" \
+        "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    client-fingerprint: chrome" \
+        "    skip-cert-verify: false" \
+        "    ws-opts:" \
+        "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+        "      headers:" \
+        "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_YAML"
+    fi
   fi
 
   if [[ "${#proxies[@]}" -eq 0 ]]; then
@@ -3863,25 +3955,44 @@ build_subscription_clash_stable_yaml() {
   if has_cdn_vmess_install; then
     name="$NODE_NAME_CDN_VMESS"
     proxies+=("$name")
-    printf '%s\n' \
-      "  - name: $(yaml_quote "$name")" \
-      "    type: vmess" \
-      "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
-      "    port: 443" \
-      "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
-      "    alterId: 0" \
-      "    cipher: auto" \
-      "    network: ws" \
-      "    tls: true" \
-      "    udp: true" \
-      "    ip-version: ipv4-prefer" \
-      "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
-      "    client-fingerprint: chrome" \
-      "    skip-cert-verify: false" \
-      "    ws-opts:" \
-      "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
-      "      headers:" \
-      "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_STABLE_YAML"
+    if cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+      printf '%s\n' \
+        "  - name: $(yaml_quote "$name")" \
+        "    type: vmess" \
+        "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    port: ${CDN_VMESS_PORT}" \
+        "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+        "    alterId: 0" \
+        "    cipher: auto" \
+        "    network: ws" \
+        "    tls: false" \
+        "    udp: true" \
+        "    ip-version: ipv4-prefer" \
+        "    ws-opts:" \
+        "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+        "      headers:" \
+        "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_STABLE_YAML"
+    else
+      printf '%s\n' \
+        "  - name: $(yaml_quote "$name")" \
+        "    type: vmess" \
+        "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    port: 443" \
+        "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+        "    alterId: 0" \
+        "    cipher: auto" \
+        "    network: ws" \
+        "    tls: true" \
+        "    udp: true" \
+        "    ip-version: ipv4-prefer" \
+        "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+        "    client-fingerprint: chrome" \
+        "    skip-cert-verify: false" \
+        "    ws-opts:" \
+        "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+        "      headers:" \
+        "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_STABLE_YAML"
+    fi
   fi
 
   if [[ "${#proxies[@]}" -eq 0 ]]; then
