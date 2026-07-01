@@ -164,7 +164,7 @@ tls_skip_verify_bool() {
 disable_legacy_protocol_services() { :; }
 sing_box_has_enabled_inbound() {
   has_vless_install || has_hy2_install || has_anytls_install || has_ss2022_install || \
-    has_vmess_install || has_tuic_install || has_argo_install
+    has_vmess_install || has_tuic_install || has_argo_install || has_cdn_vmess_install
 }
 ensure_dual_stack_ipv6_bind() {
   sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
@@ -654,6 +654,101 @@ cf_upsert_tunnel_dns() {
   fi
 }
 
+# =============================================================================
+# CDN VMess WS: Cloudflare API 函数
+# =============================================================================
+
+cf_upsert_cdn_vmess_dns() {
+  local cdn_domain="$1" vps_ip="$2" zone_id="$3"
+  local response record_id data
+
+  response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${cdn_domain}&type=A&per_page=100")" || return 1
+  record_id="$(printf '%s' "$response" | jq -r '.result[0].id // empty')"
+  data="$(jq -nc --arg type "A" --arg name "$cdn_domain" --arg content "$vps_ip" \
+    '{type:$type,name:$name,content:$content,ttl:1,proxied:true}')"
+
+  if [[ -n "$record_id" ]]; then
+    yellow "更新已有 A 记录: ${cdn_domain} -> ${vps_ip} (橙云代理)"
+    cf_api_request PUT "/zones/${zone_id}/dns_records/${record_id}" "$data" >/dev/null
+  else
+    yellow "创建新 A 记录: ${cdn_domain} -> ${vps_ip} (橙云代理)"
+    cf_api_request POST "/zones/${zone_id}/dns_records" "$data" >/dev/null
+  fi
+}
+
+cf_set_origin_port_rule() {
+  local cdn_domain="$1" origin_port="$2" zone_id="$3"
+  local response ruleset_id existing_rules new_rule merged_rules data rule_exists
+
+  # 读取当前 http_config_settings phase 的 ruleset
+  response="$(cf_api_request GET "/zones/${zone_id}/rulesets/phases/http_config_settings/entrypoint" 2>/dev/null)" || response=""
+  ruleset_id="$(printf '%s' "$response" | jq -r '.result.id // empty' 2>/dev/null)"
+
+  # 构建新的 Origin Rule
+  new_rule="$(jq -nc \
+    --arg desc "CDN-VMess origin port: ${cdn_domain} -> ${origin_port}" \
+    --arg expr "(http.host eq \"${cdn_domain}\")" \
+    --argjson port "$origin_port" \
+    '{
+      action: "route",
+      expression: $expr,
+      description: $desc,
+      action_parameters: {
+        origin: {
+          port: $port
+        }
+      }
+    }')"
+
+  if [[ -n "$ruleset_id" ]]; then
+    # 已有 ruleset，检查是否存在相同域名的规则
+    existing_rules="$(printf '%s' "$response" | jq -c '.result.rules // []')"
+    rule_exists="$(printf '%s' "$existing_rules" | jq --arg domain "$cdn_domain" \
+      '[.[] | select(.expression | contains($domain))] | length')"
+
+    if [[ "$rule_exists" -gt 0 ]]; then
+      # 替换同域名的旧规则
+      merged_rules="$(printf '%s' "$existing_rules" | jq -c --arg domain "$cdn_domain" --argjson new "$new_rule" \
+        '[.[] | select(.expression | contains($domain) | not)] + [$new]')"
+    else
+      # 追加新规则
+      merged_rules="$(printf '%s' "$existing_rules" | jq -c --argjson new "$new_rule" '. + [$new]')"
+    fi
+    data="$(jq -nc --argjson rules "$merged_rules" '{rules:$rules}')"
+    yellow "更新 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
+    cf_api_request PUT "/zones/${zone_id}/rulesets/${ruleset_id}" "$data" >/dev/null
+  else
+    # 没有 ruleset，创建新的
+    data="$(jq -nc --argjson rules "[$new_rule]" \
+      '{name:"CDN-VMess Origin Rules",kind:"zone",phase:"http_config_settings",rules:$rules}')"
+    yellow "创建 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
+    cf_api_request POST "/zones/${zone_id}/rulesets" "$data" >/dev/null
+  fi
+}
+
+cf_configure_cdn_vmess() {
+  local cdn_domain="$1" origin_port="$2" vps_ip="$3"
+
+  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
+  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
+
+  yellow "正在查找 Cloudflare Zone: ${cdn_domain}"
+  cf_find_zone_for_host "$cdn_domain" || return 1
+  CDN_VMESS_CF_ZONE_ID="$ARGO_CF_ZONE_ID"
+  CDN_VMESS_CF_ZONE_NAME="$ARGO_CF_ZONE_NAME"
+
+  yellow "正在配置 DNS A 记录 (橙云代理)..."
+  cf_upsert_cdn_vmess_dns "$cdn_domain" "$vps_ip" "$CDN_VMESS_CF_ZONE_ID" || return 1
+
+  yellow "正在配置 Origin Rules (端口回源)..."
+  cf_set_origin_port_rule "$cdn_domain" "$origin_port" "$CDN_VMESS_CF_ZONE_ID" || return 1
+
+  green "Cloudflare CDN VMess 配置完成。"
+  echo "域名: ${cdn_domain} (橙云代理已开启)"
+  echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
+  echo "Origin Rule: 客户端 -> ${cdn_domain}:443 -> CF CDN -> VPS:${origin_port}"
+}
+
 cf_configure_named_tunnel() {
   local tunnel_name
   command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
@@ -768,6 +863,7 @@ save_state() {
              DOMAIN SNI_VAL SELF_SIGN_CERT \
              NODE_NAME_VLESS NODE_NAME_HY2 NODE_NAME_SS2022 NODE_NAME_VMESS NODE_NAME_TUIC NODE_NAME_ARGO NODE_NAME_ANYTLS \
              VLESS_ENABLED HY2_ENABLED SS2022_ENABLED VMESS_ENABLED TUIC_ENABLED ARGO_ENABLED ANYTLS_ENABLED \
+             CDN_VMESS_PORT CDN_VMESS_UUID CDN_VMESS_WS_PATH CDN_VMESS_CDN_DOMAIN CDN_VMESS_ORIGIN_PORT CDN_VMESS_SERVER_ADDR CDN_VMESS_ENABLED CDN_VMESS_CF_ZONE_ID CDN_VMESS_CF_ZONE_NAME NODE_NAME_CDN_VMESS \
              ARGO_TUNNEL_MODE; do
     val="${!var:-}"
     [[ -n "$val" ]] && printf '%s=%s\n' "$var" "$val" >> "$tmp"
@@ -783,6 +879,7 @@ has_ss2022_install() { [[ "${SS2022_ENABLED:-}" != "0" && -n "${SS2022_PORT:-}" 
 has_vmess_install() { [[ "${VMESS_ENABLED:-}" != "0" && -n "${VMESS_PORT:-}" && -n "${VMESS_UUID:-}" && -n "${VMESS_WS_PATH:-}" ]]; }
 has_tuic_install() { [[ "${TUIC_ENABLED:-}" != "0" && -n "${TUIC_PORT:-}" && -n "${TUIC_PASSWORD:-}" && -n "${TUIC_UUID:-}" ]]; }
 has_argo_install() { [[ "${ARGO_ENABLED:-}" != "0" && -n "${ARGO_LOCAL_PORT:-}" && -n "${ARGO_UUID:-}" && -n "${ARGO_WS_PATH:-}" ]]; }
+has_cdn_vmess_install() { [[ "${CDN_VMESS_ENABLED:-}" == "1" && -n "${CDN_VMESS_PORT:-}" && -n "${CDN_VMESS_UUID:-}" && -n "${CDN_VMESS_WS_PATH:-}" && -n "${CDN_VMESS_CDN_DOMAIN:-}" ]]; }
 has_subscription_service() { [[ "${SUB_ENABLED:-}" != "0" && -n "${SUB_PORT:-}" && -n "${SUB_PATH:-}" ]]; }
 load_argo_edge_pool() {
   if [[ "${ARGO_MULTI_EDGE:-0}" != "1" || ! -r "${ARGO_EDGE_POOL_FILE:-}" ]]; then
@@ -910,6 +1007,10 @@ ARGO_SHARE_TXT="${NODE_INFO_DIR}/argo-share.txt"
 ARGO_SUB_RAW_TXT="${NODE_INFO_DIR}/argo-subscription-raw.txt"
 ARGO_SUB_B64_TXT="${NODE_INFO_DIR}/argo-subscription-base64.txt"
 ARGO_QR_PNG="${NODE_INFO_DIR}/argo-node-qr.png"
+CDN_VMESS_SHARE_TXT="${NODE_INFO_DIR}/cdn-vmess-share.txt"
+CDN_VMESS_SUB_RAW_TXT="${NODE_INFO_DIR}/cdn-vmess-subscription-raw.txt"
+CDN_VMESS_SUB_B64_TXT="${NODE_INFO_DIR}/cdn-vmess-subscription-base64.txt"
+CDN_VMESS_QR_PNG="${NODE_INFO_DIR}/cdn-vmess-node-qr.png"
 COMBO_SUB_RAW_TXT="${NODE_INFO_DIR}/combo-sub-raw.txt"
 COMBO_SUB_B64_TXT="${NODE_INFO_DIR}/combo-sub-base64.txt"
 SUB_URI_RAW_TXT="${SUBSCRIPTION_DIR}/raw.txt"
@@ -932,6 +1033,7 @@ NODE_NAME_SS2022="${NODE_NAME_SS2022:-SS-2022}"
 NODE_NAME_VMESS="${NODE_NAME_VMESS:-VMess-WS}"
 NODE_NAME_TUIC="${NODE_NAME_TUIC:-TUIC-v5}"
 NODE_NAME_ARGO="${NODE_NAME_ARGO:-Argo-VLESS}"
+NODE_NAME_CDN_VMESS="${NODE_NAME_CDN_VMESS:-CDN-VMess}"
 
 # 密码/密钥生成函数
 generate_hy2_password() {
@@ -1155,6 +1257,10 @@ write_sing_box_config() {
     --arg tuic_password "${TUIC_PASSWORD:-}" \
     --arg tuic_uuid "${TUIC_UUID:-}" \
     --arg tuic_tls_sni "${TUIC_TLS_SNI:-${DOMAIN:-}}" \
+    --arg cdn_vmess_enabled "${CDN_VMESS_ENABLED:-0}" \
+    --arg cdn_vmess_port "${CDN_VMESS_PORT:-}" \
+    --arg cdn_vmess_uuid "${CDN_VMESS_UUID:-}" \
+    --arg cdn_vmess_ws_path "${CDN_VMESS_WS_PATH:-}" \
     --arg public_listen "$public_listen" '
 [
   (if $uuid != "" and $private_key != "" and $public_key != "" and $short_id != "" then
@@ -1317,6 +1423,28 @@ write_sing_box_config() {
         "alpn": ["h3"],
         "certificate_path": $cert_path,
         "key_path": $key_path
+      }
+    }
+  else empty end),
+  (if $cdn_vmess_enabled == "1" and $cdn_vmess_port != "" and $cdn_vmess_uuid != "" and $cdn_vmess_ws_path != "" then
+    {
+      "type": "vmess",
+      "tag": "cdn-vmess-ws-in",
+      "listen": $public_listen,
+      "listen_port": ($cdn_vmess_port | tonumber),
+      "users": [
+        {
+          "name": "cdn-vmess",
+          "uuid": $cdn_vmess_uuid,
+          "alterId": 0
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": $cdn_vmess_ws_path
+      },
+      "tls": {
+        "enabled": false
       }
     }
   else empty end)
@@ -1752,6 +1880,10 @@ show_node_info() {
     save_state
   fi
 
+  if has_cdn_vmess_install; then
+    build_cdn_vmess_share_files
+  fi
+
   build_combined_subscription_files || true
 
   cyan "================ 节点信息 ================"
@@ -1812,6 +1944,15 @@ show_node_info() {
     echo
   fi
 
+  if has_cdn_vmess_install; then
+    echo "[CDN+VMess+WS URL]"
+    if [[ -f "$CDN_VMESS_SUB_RAW_TXT" ]]; then
+      sed -n '1p' "$CDN_VMESS_SUB_RAW_TXT"
+    fi
+    echo "  (客户端 → ${CDN_VMESS_CDN_DOMAIN}:443 → CF CDN → VPS:${CDN_VMESS_PORT})"
+    echo
+  fi
+
   if has_subscription_service; then
     local sub_url
     sub_url="$(subscription_url)"
@@ -1829,7 +1970,7 @@ show_node_info() {
     echo
   fi
 
-  if ! has_vless_install && ! has_hy2_install && ! has_anytls_install && ! has_ss2022_install && ! has_tuic_install && ! has_vmess_install && ! has_argo_install; then
+  if ! has_vless_install && ! has_hy2_install && ! has_anytls_install && ! has_ss2022_install && ! has_tuic_install && ! has_vmess_install && ! has_argo_install && ! has_cdn_vmess_install; then
     yellow "未检测到可展示的协议配置"
   fi
 
@@ -2748,6 +2889,122 @@ build_argo_share_files() {
   fi
 }
 
+# =============================================================================
+# CDN+VMess+WS: 安装、URI 生成、分享文件
+# =============================================================================
+
+cdn_vmess_uri() {
+  local e_label
+  e_label="$(urlenc "$NODE_NAME_CDN_VMESS")"
+  printf 'vmess://%s' "$(echo -n '{"add":"'"${CDN_VMESS_CDN_DOMAIN}"'","aid":"0","host":"'"${CDN_VMESS_CDN_DOMAIN}"'","id":"'"${CDN_VMESS_UUID}"'","net":"ws","path":"'"${CDN_VMESS_WS_PATH}"'","port":"443","ps":"'"${NODE_NAME_CDN_VMESS}"'","tls":"tls","sni":"'"${CDN_VMESS_CDN_DOMAIN}"'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)"
+}
+
+build_cdn_vmess_share_files() {
+  local uri
+  ensure_node_info_dir
+  uri="$(cdn_vmess_uri)"
+
+  printf '%s\n' \
+    "type: CDN+VMess+WS" \
+    "cdnDomain: ${CDN_VMESS_CDN_DOMAIN}" \
+    "clientPort: 443 (CF CDN)" \
+    "originPort: ${CDN_VMESS_PORT} (VPS)" \
+    "uuid: ${CDN_VMESS_UUID}" \
+    "wsPath: ${CDN_VMESS_WS_PATH}" \
+    "cfZone: ${CDN_VMESS_CF_ZONE_NAME:-unknown}" \
+    "note: 客户端连接 ${CDN_VMESS_CDN_DOMAIN}:443，经 CF CDN 加速回源至 VPS:${CDN_VMESS_PORT}" \
+    "" \
+    "=== CDN VMess-WS URI ===" \
+    "$uri" > "$CDN_VMESS_SHARE_TXT"
+
+  printf '%s\n' "$uri" > "$CDN_VMESS_SUB_RAW_TXT"
+  base64 -w 0 < "$CDN_VMESS_SUB_RAW_TXT" > "$CDN_VMESS_SUB_B64_TXT"
+
+  if command -v qrencode >/dev/null 2>&1; then
+    printf '%s' "$uri" | qrencode -o "$CDN_VMESS_QR_PNG" -t PNG -s 8 -m 2 >/dev/null 2>&1 || true
+  fi
+}
+
+install_cdn_vmess_core() {
+  local cdn_domain api_token input_port vps_ip
+
+  echo ""
+  cyan "=== CDN+VMess+WS 节点安装 ==="
+  echo "此模式通过 Cloudflare CDN 加速 VMess+WS 流量。"
+  echo "客户端连接 CDN域名:443 → CF CDN → 回源到 VPS 自定义端口。"
+  echo ""
+
+  # 1. 获取 CF API Token
+  read -r -p "请输入 Cloudflare API Token: " api_token
+  api_token="$(printf '%s' "$api_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -z "$api_token" ]]; then
+    red "API Token 不能为空。"
+    return 1
+  fi
+  CF_API_TOKEN="$api_token"
+
+  # 2. 获取 CDN 加速域名
+  read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain
+  cdn_domain="$(printf '%s' "$cdn_domain" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+  if [[ -z "$cdn_domain" ]]; then
+    red "CDN 域名不能为空。"
+    return 1
+  fi
+
+  # 3. 获取回源端口
+  read -r -p "请输入 VPS 回源端口 (留空随机 50000-60000): " input_port
+  if [[ -z "$input_port" ]]; then
+    CDN_VMESS_PORT="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+    echo "已自动分配回源端口: ${CDN_VMESS_PORT}"
+  elif [[ "$input_port" =~ ^[0-9]+$ ]] && (( input_port >= 1 && input_port <= 65535 )); then
+    CDN_VMESS_PORT="$input_port"
+  else
+    red "端口无效。"
+    return 1
+  fi
+
+  # 4. 检测 VPS 公网 IP
+  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  if [[ -z "$vps_ip" ]]; then
+    read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
+    [[ -n "$vps_ip" ]] || { red "VPS IP 不能为空。"; return 1; }
+  fi
+  echo "VPS 公网 IP: ${vps_ip}"
+
+  # 5. 生成 VMess 身份
+  CDN_VMESS_UUID="${UUID:-$(generate_uuid_v4)}"
+  CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
+  CDN_VMESS_CDN_DOMAIN="$cdn_domain"
+  CDN_VMESS_SERVER_ADDR="$vps_ip"
+  CDN_VMESS_ORIGIN_PORT="$CDN_VMESS_PORT"
+
+  # 6. 调用 CF API 配置
+  echo ""
+  if ! cf_configure_cdn_vmess "$cdn_domain" "$CDN_VMESS_PORT" "$vps_ip"; then
+    red "Cloudflare CDN 配置失败。"
+    return 1
+  fi
+
+  # 7. 安装 sing-box 并写入配置
+  install_sing_box
+  CDN_VMESS_ENABLED="1"
+  write_sing_box_config || { red "sing-box 配置写入失败。"; return 1; }
+
+  # 8. 构建分享文件
+  build_cdn_vmess_share_files
+
+  save_state
+
+  green "CDN+VMess+WS 节点安装成功！"
+  echo ""
+  echo "连接方式: 客户端 → ${cdn_domain}:443 (TLS) → CF CDN → VPS:${CDN_VMESS_PORT} (HTTP)"
+  echo ""
+  echo "[CDN VMess-WS URI]"
+  cdn_vmess_uri
+  echo ""
+  return 0
+}
+
 install_argo_core() {
   select_argo_edge_server
   install_sing_box
@@ -3141,6 +3398,16 @@ write_uri_subscription_raw() {
     fi
   fi
 
+  if has_cdn_vmess_install; then
+    build_cdn_vmess_share_files
+    if [[ -f "$CDN_VMESS_SUB_RAW_TXT" ]]; then
+      sed '/^[[:space:]]*$/d' "$CDN_VMESS_SUB_RAW_TXT" >> "$out_file"
+    else
+      cdn_vmess_uri >> "$out_file"
+      printf '\n' >> "$out_file"
+    fi
+  fi
+
   [[ -s "$out_file" ]]
   ARGO_EDGE_INDEX="$saved_index"
 }
@@ -3342,6 +3609,30 @@ build_subscription_clash_yaml() {
         "      headers:" \
         "        Host: $(yaml_quote "$ARGO_DOMAIN")" >> "$SUB_CLASH_YAML"
     fi
+  fi
+
+  if has_cdn_vmess_install; then
+    name="$NODE_NAME_CDN_VMESS"
+    proxies+=("$name")
+    printf '%s\n' \
+      "  - name: $(yaml_quote "$name")" \
+      "    type: vmess" \
+      "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+      "    port: 443" \
+      "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+      "    alterId: 0" \
+      "    cipher: auto" \
+      "    network: ws" \
+      "    tls: true" \
+      "    udp: true" \
+      "    ip-version: ipv4-prefer" \
+      "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+      "    client-fingerprint: chrome" \
+      "    skip-cert-verify: false" \
+      "    ws-opts:" \
+      "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+      "      headers:" \
+      "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_YAML"
   fi
 
   if [[ "${#proxies[@]}" -eq 0 ]]; then
@@ -3572,6 +3863,30 @@ build_subscription_clash_stable_yaml() {
         "      headers:" \
         "        Host: $(yaml_quote "$ARGO_DOMAIN")" >> "$SUB_CLASH_STABLE_YAML"
     fi
+  fi
+
+  if has_cdn_vmess_install; then
+    name="$NODE_NAME_CDN_VMESS"
+    proxies+=("$name")
+    printf '%s\n' \
+      "  - name: $(yaml_quote "$name")" \
+      "    type: vmess" \
+      "    server: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+      "    port: 443" \
+      "    uuid: $(yaml_quote "$CDN_VMESS_UUID")" \
+      "    alterId: 0" \
+      "    cipher: auto" \
+      "    network: ws" \
+      "    tls: true" \
+      "    udp: true" \
+      "    ip-version: ipv4-prefer" \
+      "    servername: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" \
+      "    client-fingerprint: chrome" \
+      "    skip-cert-verify: false" \
+      "    ws-opts:" \
+      "      path: $(yaml_quote "$CDN_VMESS_WS_PATH")" \
+      "      headers:" \
+      "        Host: $(yaml_quote "$CDN_VMESS_CDN_DOMAIN")" >> "$SUB_CLASH_STABLE_YAML"
   fi
 
   if [[ "${#proxies[@]}" -eq 0 ]]; then
@@ -4328,6 +4643,44 @@ uninstall_all() {
   green "卸载完成，sing-box 服务和二进制已清理。"
 }
 
+create_node_submenu() {
+  while true; do
+    clear
+    cyan "================================================="
+    cyan "             创建代理节点"
+    cyan "================================================="
+    echo "  1) 一键生成所有标准协议 (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo)"
+    echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
+    echo "  0) 返回主菜单"
+    cyan "================================================="
+    read -r -p "请输入对应的数字: " sub_choice
+
+    case "$sub_choice" in
+      1)
+        if ! do_one_click_all; then
+          red "创建代理节点失败。"
+          echo "按回车键返回..."
+          read -r
+        fi
+        ;;
+      2)
+        if ! install_cdn_vmess_core; then
+          red "CDN+VMess+WS 节点安装失败。"
+        fi
+        echo "按回车键返回..."
+        read -r
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        red "无效输入。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 main_menu() {
   while true; do
     load_state >/dev/null 2>&1 || true
@@ -4388,11 +4741,7 @@ main_menu() {
         read -r
         ;;
       3)
-        if ! do_one_click_all; then
-          red "创建代理节点失败。"
-          echo "按回车键返回主菜单..."
-          read -r
-        fi
+        create_node_submenu
         ;;
       4)
         apply_network_tuning_menu
