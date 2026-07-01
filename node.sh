@@ -692,9 +692,9 @@ cf_upsert_cdn_vmess_dns() {
 cf_set_origin_port_rule() {
   local cdn_domain="$1" origin_port="$2" zone_id="$3"
   local response existing_rules new_rule merged_rules data rule_exists
-  local phase_endpoint="/zones/${zone_id}/rulesets/phases/http_config_settings/entrypoint"
+  local phase_endpoint="/zones/${zone_id}/rulesets/phases/http_request_origin/entrypoint"
 
-  # 读取当前 http_config_settings phase 的 ruleset（可能不存在，404 是正常的）
+  # 读取当前 http_request_origin phase 的 ruleset（可能不存在，404 是正常的）
   response="$(cf_api_request GET "$phase_endpoint" 2>/dev/null)" || response=""
   if [[ -z "$response" ]] || ! printf '%s' "$response" | jq -e '.result.rules' >/dev/null 2>&1; then
     existing_rules="[]"
