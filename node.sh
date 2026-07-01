@@ -678,11 +678,12 @@ cf_upsert_cdn_vmess_dns() {
 
 cf_set_origin_port_rule() {
   local cdn_domain="$1" origin_port="$2" zone_id="$3"
-  local response ruleset_id existing_rules new_rule merged_rules data rule_exists
+  local response existing_rules new_rule merged_rules data rule_exists
+  local phase_endpoint="/zones/${zone_id}/rulesets/phases/http_config_settings/entrypoint"
 
-  # 读取当前 http_config_settings phase 的 ruleset
-  response="$(cf_api_request GET "/zones/${zone_id}/rulesets/phases/http_config_settings/entrypoint" 2>/dev/null)" || response=""
-  ruleset_id="$(printf '%s' "$response" | jq -r '.result.id // empty' 2>/dev/null)"
+  # 读取当前 http_config_settings phase 的 ruleset（可能不存在，404 是正常的）
+  response="$(cf_api_request GET "$phase_endpoint" 2>/dev/null)" || response=""
+  existing_rules="$(printf '%s' "$response" | jq -c '.result.rules // []' 2>/dev/null)" || existing_rules="[]"
 
   # 构建新的 Origin Rule
   new_rule="$(jq -nc \
@@ -700,30 +701,24 @@ cf_set_origin_port_rule() {
       }
     }')"
 
-  if [[ -n "$ruleset_id" ]]; then
-    # 已有 ruleset，检查是否存在相同域名的规则
-    existing_rules="$(printf '%s' "$response" | jq -c '.result.rules // []')"
-    rule_exists="$(printf '%s' "$existing_rules" | jq --arg domain "$cdn_domain" \
-      '[.[] | select(.expression | contains($domain))] | length')"
+  # 检查是否已有相同域名的规则
+  rule_exists="$(printf '%s' "$existing_rules" | jq --arg domain "$cdn_domain" \
+    '[.[] | select(.expression | contains($domain))] | length' 2>/dev/null)" || rule_exists="0"
 
-    if [[ "$rule_exists" -gt 0 ]]; then
-      # 替换同域名的旧规则
-      merged_rules="$(printf '%s' "$existing_rules" | jq -c --arg domain "$cdn_domain" --argjson new "$new_rule" \
-        '[.[] | select(.expression | contains($domain) | not)] + [$new]')"
-    else
-      # 追加新规则
-      merged_rules="$(printf '%s' "$existing_rules" | jq -c --argjson new "$new_rule" '. + [$new]')"
-    fi
-    data="$(jq -nc --argjson rules "$merged_rules" '{rules:$rules}')"
+  if [[ "$rule_exists" -gt 0 ]]; then
+    # 替换同域名的旧规则，保留其他规则
+    merged_rules="$(printf '%s' "$existing_rules" | jq -c --arg domain "$cdn_domain" --argjson new "$new_rule" \
+      '[.[] | select(.expression | contains($domain) | not)] + [$new]')"
     yellow "更新 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
-    cf_api_request PUT "/zones/${zone_id}/rulesets/${ruleset_id}" "$data" >/dev/null
   else
-    # 没有 ruleset，创建新的
-    data="$(jq -nc --argjson rules "[$new_rule]" \
-      '{name:"CDN-VMess Origin Rules",kind:"zone",phase:"http_config_settings",rules:$rules}')"
+    # 追加新规则到现有规则列表
+    merged_rules="$(printf '%s' "$existing_rules" | jq -c --argjson new "$new_rule" '. + [$new]')"
     yellow "创建 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
-    cf_api_request POST "/zones/${zone_id}/rulesets" "$data" >/dev/null
   fi
+
+  # 统一用 PUT 到 phase entrypoint（无论是否已有 ruleset，PUT 都会创建或更新）
+  data="$(jq -nc --argjson rules "$merged_rules" '{rules:$rules}')"
+  cf_api_request PUT "$phase_endpoint" "$data" >/dev/null
 }
 
 cf_configure_cdn_vmess() {
