@@ -138,6 +138,44 @@ detect_cloudflared_asset() {
 }
 curl_fsSL() { curl -fsSL "$@"; }
 
+install_required_command() {
+  local cmd="$1" pkg="${2:-$1}" manager=""
+
+  command -v "$cmd" >/dev/null 2>&1 && return 0
+
+  yellow "missing ${cmd}, trying to install ${pkg}..."
+  if command -v apt-get >/dev/null 2>&1; then
+    manager="apt"
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
+  elif command -v dnf >/dev/null 2>&1; then
+    manager="dnf"
+    dnf install -y "$pkg"
+  elif command -v yum >/dev/null 2>&1; then
+    manager="yum"
+    yum install -y "$pkg"
+  elif command -v apk >/dev/null 2>&1; then
+    manager="apk"
+    apk add --no-cache "$pkg"
+  elif command -v pacman >/dev/null 2>&1; then
+    manager="pacman"
+    pacman -Sy --noconfirm "$pkg"
+  elif command -v zypper >/dev/null 2>&1; then
+    manager="zypper"
+    zypper --non-interactive install "$pkg"
+  else
+    red "missing ${cmd}; no supported package manager found. Please install ${pkg} manually."
+    return 1
+  fi
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    green "${cmd} installed by ${manager}."
+    return 0
+  fi
+
+  red "failed to install ${cmd}. Please install ${pkg} manually and retry."
+  return 1
+}
+
 # 网络与编码辅助函数
 preferred_direct_server_addr() { curl -s4 icanhazip.com || echo "127.0.0.1"; }
 detect_public_ipv4() { preferred_direct_server_addr; }
@@ -755,8 +793,8 @@ cf_is_standard_http_port() {
 cf_configure_cdn_vmess() {
   local cdn_domain="$1" origin_port="$2" vps_ip="$3" need_origin_rule="$4"
 
-  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
-  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
+  install_required_command jq || return 1
+  install_required_command curl || return 1
 
   yellow "正在查找 Cloudflare Zone: ${cdn_domain}"
   cf_find_zone_for_host "$cdn_domain" || return 1
@@ -785,7 +823,7 @@ cf_configure_cdn_vmess() {
 cf_upsert_site_dns() {
   local site_domain="$1" vps_ip="$2" proxied="${3:-false}"
   local response record_id data zone_id proxied_json
-  command -v jq >/dev/null 2>&1 || { red "missing jq"; return 1; }
+  install_required_command jq || return 1
   cf_find_zone_for_host "$site_domain" || return 1
   zone_id="$ARGO_CF_ZONE_ID"
   response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${site_domain}&per_page=100")" || return 1
@@ -802,7 +840,7 @@ cf_upsert_site_dns() {
 
 issue_cf_dns_certificate() {
   local cert_domain="$1" acme_bin="${HOME}/.acme.sh/acme.sh"
-  command -v curl >/dev/null 2>&1 || { red "missing curl"; return 1; }
+  install_required_command curl || return 1
   mkdir -p "$SSL_DIR"
   if [[ ! -x "$acme_bin" ]]; then
     yellow "installing acme.sh..."
@@ -916,8 +954,8 @@ create_cf_proxy_node() {
 
 cf_configure_named_tunnel() {
   local tunnel_name
-  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
-  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
+  install_required_command jq || return 1
+  install_required_command curl || return 1
 
   yellow "正在查找 Cloudflare Zone..."
   cf_find_zone_for_host "$ARGO_FIXED_DOMAIN" || return 1
@@ -5377,5 +5415,3 @@ case "${1:-}" in
     main_menu
     ;;
 esac
-
-
