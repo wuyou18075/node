@@ -138,44 +138,6 @@ detect_cloudflared_asset() {
 }
 curl_fsSL() { curl -fsSL "$@"; }
 
-install_required_command() {
-  local cmd="$1" pkg="${2:-$1}" manager=""
-
-  command -v "$cmd" >/dev/null 2>&1 && return 0
-
-  yellow "missing ${cmd}, trying to install ${pkg}..."
-  if command -v apt-get >/dev/null 2>&1; then
-    manager="apt"
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
-  elif command -v dnf >/dev/null 2>&1; then
-    manager="dnf"
-    dnf install -y "$pkg"
-  elif command -v yum >/dev/null 2>&1; then
-    manager="yum"
-    yum install -y "$pkg"
-  elif command -v apk >/dev/null 2>&1; then
-    manager="apk"
-    apk add --no-cache "$pkg"
-  elif command -v pacman >/dev/null 2>&1; then
-    manager="pacman"
-    pacman -Sy --noconfirm "$pkg"
-  elif command -v zypper >/dev/null 2>&1; then
-    manager="zypper"
-    zypper --non-interactive install "$pkg"
-  else
-    red "missing ${cmd}; no supported package manager found. Please install ${pkg} manually."
-    return 1
-  fi
-
-  if command -v "$cmd" >/dev/null 2>&1; then
-    green "${cmd} installed by ${manager}."
-    return 0
-  fi
-
-  red "failed to install ${cmd}. Please install ${pkg} manually and retry."
-  return 1
-}
-
 # 网络与编码辅助函数
 preferred_direct_server_addr() { curl -s4 icanhazip.com || echo "127.0.0.1"; }
 detect_public_ipv4() { preferred_direct_server_addr; }
@@ -565,7 +527,7 @@ mask_site_script_fetch_url() {
 }
 
 run_remote_mask_site_script() {
-  local action="$1" tmp_script patched_script url rc auto_domain
+  local action="$1" tmp_script url rc
   command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法拉取远程站点脚本。"; return 1; }
   url="$(mask_site_script_fetch_url)"
   yellow "正在从远程加载站点脚本：${MASK_SITE_SCRIPT_URL}"
@@ -575,39 +537,7 @@ run_remote_mask_site_script() {
     red "远程站点脚本下载失败：${MASK_SITE_SCRIPT_URL}"
     return 1
   fi
-
-  if [[ "${USE_CF_ORIGIN_CA_CERT:-0}" == "1" ]]; then
-    patched_script="${tmp_script}.patched"
-    awk '
-      /if cert_matches_domain "\$\{SSL_DIR\}\/fullchain\.cer" "\$SITE_DOMAIN" && cert_is_valid/ {
-        print
-        print "    if [[ \"${USE_CF_ORIGIN_CA_CERT:-0}\" == \"1\" ]]; then"
-        print "      yellow \"Using existing Cloudflare Origin CA certificate.\""
-        print "      return 0"
-        print "    fi"
-        next
-      }
-      /read -r -p .*input_domain/ {
-        print "  if [[ -n \"${SITE_DOMAIN:-}\" ]]; then"
-        print "    input_domain=\"$SITE_DOMAIN\""
-        print "  else"
-        print
-        print "  fi"
-        next
-      }
-      { print }
-    ' "$tmp_script" > "$patched_script" && mv "$patched_script" "$tmp_script"
-  fi
-
-  auto_domain="${SITE_DOMAIN:-${DOMAIN:-}}"
-  if [[ "$action" == "deploy" && -n "$auto_domain" ]]; then
-    printf '\n' | \
-      SITE_DOMAIN="$auto_domain" DOMAIN="$auto_domain" SNI_VAL="${SNI_VAL:-$auto_domain}" \
-      SELF_SIGN_CERT="${SELF_SIGN_CERT:-1}" USE_CF_ORIGIN_CA_CERT="${USE_CF_ORIGIN_CA_CERT:-0}" \
-      bash "$tmp_script" "$action"
-  else
-    bash "$tmp_script" "$action"
-  fi
+  bash "$tmp_script" "$action"
   rc=$?
   rm -f "$tmp_script"
   return "$rc"
@@ -825,8 +755,8 @@ cf_is_standard_http_port() {
 cf_configure_cdn_vmess() {
   local cdn_domain="$1" origin_port="$2" vps_ip="$3" need_origin_rule="$4"
 
-  install_required_command jq || return 1
-  install_required_command curl || return 1
+  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
+  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
 
   yellow "正在查找 Cloudflare Zone: ${cdn_domain}"
   cf_find_zone_for_host "$cdn_domain" || return 1
@@ -851,200 +781,10 @@ cf_configure_cdn_vmess() {
   fi
 }
 
-
-cf_upsert_site_dns() {
-  local site_domain="$1" vps_ip="$2" proxied="${3:-false}"
-  local response record_id data zone_id proxied_json
-  install_required_command jq || return 1
-  cf_find_zone_for_host "$site_domain" || return 1
-  zone_id="$ARGO_CF_ZONE_ID"
-  response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${site_domain}&per_page=100")" || return 1
-  record_id="$(printf '%s' "$response" | jq -r '.result[]? | select(.type == "A") | .id' 2>/dev/null | head -1)"
-  [[ "$proxied" == "true" ]] && proxied_json="true" || proxied_json="false"
-  data="$(jq -nc --arg type "A" --arg name "$site_domain" --arg content "$vps_ip" --argjson proxied "$proxied_json" \
-    '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')"
-  if [[ -n "$record_id" ]]; then
-    cf_api_request PUT "/zones/${zone_id}/dns_records/${record_id}" "$data" >/dev/null
-  else
-    cf_api_request POST "/zones/${zone_id}/dns_records" "$data" >/dev/null
-  fi
-}
-
-issue_cf_origin_certificate() {
-  local cert_domain="$1" csr_file response cert
-  install_required_command curl || return 1
-  install_required_command jq || return 1
-  mkdir -p "$SSL_DIR"
-
-  yellow "Issuing Cloudflare Origin CA certificate (15 years): ${cert_domain}"
-  openssl ecparam -name prime256v1 -genkey -noout -out "$SSL_DIR/private.key" || return 1
-  chmod 600 "$SSL_DIR/private.key"
-
-  csr_file="$(mktemp /tmp/cf-origin-ca.XXXXXX.csr)" || return 1
-  openssl req -new -sha256 \
-    -key "$SSL_DIR/private.key" \
-    -subj "/CN=${cert_domain}" \
-    -addext "subjectAltName=DNS:${cert_domain}" \
-    -out "$csr_file" || { rm -f "$csr_file"; return 1; }
-
-  response="$(cf_api_request POST "/certificates" "$(jq -n \
-    --rawfile csr "$csr_file" \
-    --arg host "$cert_domain" \
-    '{hostnames:[$host],requested_validity:5475,request_type:"origin-ecc",csr:$csr}')")" || {
-    rm -f "$csr_file"
-    return 1
-  }
-  rm -f "$csr_file"
-
-  cert="$(printf '%s' "$response" | jq -r '.result.certificate // empty')"
-  [[ -n "$cert" ]] || { red "Cloudflare Origin CA certificate response is empty."; return 1; }
-  printf '%s\n' "$cert" > "$SSL_DIR/fullchain.cer"
-  chmod 644 "$SSL_DIR/fullchain.cer"
-
-  DOMAIN="$cert_domain"
-  SNI_VAL="$cert_domain"
-  REALITY_SNI="${REALITY_SNI:-$cert_domain}"
-  SELF_SIGN_CERT="1"
-  USE_CF_ORIGIN_CA_CERT="1"
-}
-
-prepare_cf_proxy_mask_site() {
-  local choice site_domain vps_ip has_site existing_site
-  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
-  if [[ -z "$vps_ip" ]]; then
-    read -r -p "Input local public IP: " vps_ip
-    [[ -n "$vps_ip" ]] || { red "public IP is required"; return 1; }
-  fi
-
-  existing_site="${SITE_DOMAIN:-}"
-  if [[ -z "$existing_site" && -n "${DOMAIN:-}" && "${DOMAIN}" != "www.apple.com" ]]; then
-    existing_site="$DOMAIN"
-  fi
-  if [[ -z "$existing_site" ]]; then
-    existing_site="$(detect_cert_primary_name 2>/dev/null || true)"
-  fi
-
-  has_site="0"
-  if [[ -n "$existing_site" ]]; then
-    has_site="1"
-  fi
-
-  echo ""
-  cyan "--- Mask site / SNI ---"
-  if [[ "$has_site" == "1" ]]; then
-    echo "Found previous mask site domain: ${existing_site}"
-    read -r -p "Continue using this mask site domain? [Y/n]: " choice
-    if [[ ! "$choice" =~ ^[Nn]$ ]]; then
-      SITE_DOMAIN="$existing_site"
-      DOMAIN="$existing_site"
-      SNI_VAL="$existing_site"
-      REALITY_SNI="${REALITY_SNI:-$existing_site}"
-      SELF_SIGN_CERT="1"
-      yellow "Ensuring CF DNS A record (proxied): ${SITE_DOMAIN} -> ${vps_ip}"
-      cf_upsert_site_dns "$SITE_DOMAIN" "$vps_ip" true || return 1
-      if ! cert_files_exist || ! cert_matches_domain; then
-        issue_cf_origin_certificate "$SITE_DOMAIN" || return 1
-      else
-        USE_CF_ORIGIN_CA_CERT="1"
-      fi
-      SITE_ENABLED="1"
-      SITE_BRAND="${SITE_BRAND:-EduPanel}"
-      install_mask_site_nginx || return 1
-      save_state
-      return 0
-    fi
-    has_site="0"
-    echo "1) Create new site"
-    echo "2) Use www.apple.com as fake SNI"
-    read -r -p "Choose [default 1]: " choice
-    choice="${choice:-1}"
-    [[ "$choice" == "2" ]] && choice="3"
-  else
-    echo "No existing mask site found."
-    echo "1) Create new site"
-    echo "2) Use www.apple.com as fake SNI"
-    read -r -p "Choose [default 1]: " choice
-    choice="${choice:-1}"
-    [[ "$choice" == "2" ]] && choice="3"
-  fi
-
-  case "$choice" in
-    1)
-      if [[ "$has_site" == "1" ]]; then
-        DOMAIN="$SITE_DOMAIN"
-        SNI_VAL="$SITE_DOMAIN"
-        REALITY_SNI="${REALITY_SNI:-$SITE_DOMAIN}"
-        SELF_SIGN_CERT="0"
-        return 0
-      fi
-      ;&
-    2)
-      read -r -p "Input mask site domain: " site_domain
-      site_domain="$(normalize_argo_host "$site_domain")"
-      [[ -n "$site_domain" ]] || { red "site domain is required"; return 1; }
-      yellow "Upserting CF DNS A record (proxied): ${site_domain} -> ${vps_ip}"
-      cf_upsert_site_dns "$site_domain" "$vps_ip" true || return 1
-      issue_cf_origin_certificate "$site_domain" || return 1
-      SITE_ENABLED="1"
-      SITE_DOMAIN="$site_domain"
-      SITE_BRAND="${SITE_BRAND:-EduPanel}"
-      install_mask_site_nginx || return 1
-      save_state
-      ;;
-    3)
-      DOMAIN=""
-      SNI_VAL="www.apple.com"
-      REALITY_SNI="www.apple.com"
-      SELF_SIGN_CERT="1"
-      ;;
-    *)
-      red "invalid choice"
-      return 1
-      ;;
-  esac
-}
-
-create_cf_proxy_node() {
-  clear
-  load_state >/dev/null 2>&1 || true
-  cyan "================ Create CF Proxy Node ================"
-
-  prompt_common_uuid || return 1
-  prompt_cf_api_token || return 1
-  CF_PROXY_REUSE_READY="1"
-  save_state
-
-  prepare_cf_proxy_mask_site || return 1
-  do_one_click_all_with_cdn
-}
-
-prompt_cf_api_token() {
-  local input_cf_token use_previous token_len token_tail
-
-  if [[ -n "${CF_API_TOKEN:-}" ]]; then
-    token_len="${#CF_API_TOKEN}"
-    token_tail="$CF_API_TOKEN"
-    if (( token_len > 6 )); then
-      token_tail="${CF_API_TOKEN: -6}"
-    fi
-    echo "检测到之前使用的 Cloudflare API Token: 长度 ${token_len}，结尾 ${token_tail}"
-    read -r -p "是否继续使用该 Token? [Y/n]: " use_previous
-    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
-      echo "已继续使用历史 Cloudflare API Token。"
-      return 0
-    fi
-  fi
-
-  read -r -p "Input Cloudflare multi-purpose API Token: " input_cf_token
-  input_cf_token="$(printf '%s' "${input_cf_token:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [[ -n "$input_cf_token" ]] || { red "Cloudflare API Token is required."; return 1; }
-  CF_API_TOKEN="$input_cf_token"
-}
-
 cf_configure_named_tunnel() {
   local tunnel_name
-  install_required_command jq || return 1
-  install_required_command curl || return 1
+  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
+  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
 
   yellow "正在查找 Cloudflare Zone..."
   cf_find_zone_for_host "$ARGO_FIXED_DOMAIN" || return 1
@@ -1152,7 +892,7 @@ save_state() {
              ARGO_LOCAL_PORT ARGO_DOMAIN ARGO_UUID ARGO_WS_PATH ARGO_EDGE_SERVER ARGO_EDGE_POOL_FILE ARGO_PROTOCOL ARGO_EDGE_IP_VERSION ARGO_FIXED_DOMAIN ARGO_TUNNEL_TOKEN ARGO_TUNNEL_ID ARGO_CF_ACCOUNT_ID ARGO_CF_ZONE_ID ARGO_CF_ZONE_NAME ARGO_MULTI_EDGE \
              SUB_PORT SUB_PATH SUB_ENABLED \
              SITE_ENABLED SITE_DOMAIN SITE_BRAND SITE_ROOT NGINX_SITE_CONF VMESS_VIA_NGINX \
-             DOMAIN SNI_VAL SELF_SIGN_CERT CF_API_TOKEN \
+             DOMAIN SNI_VAL SELF_SIGN_CERT \
              NODE_NAME_VLESS NODE_NAME_HY2 NODE_NAME_SS2022 NODE_NAME_VMESS NODE_NAME_TUIC NODE_NAME_ARGO NODE_NAME_ANYTLS \
              VLESS_ENABLED HY2_ENABLED SS2022_ENABLED VMESS_ENABLED TUIC_ENABLED ARGO_ENABLED ANYTLS_ENABLED \
              CDN_VMESS_PORT CDN_VMESS_UUID CDN_VMESS_WS_PATH CDN_VMESS_CDN_DOMAIN CDN_VMESS_ORIGIN_PORT CDN_VMESS_SERVER_ADDR CDN_VMESS_ENABLED CDN_VMESS_CF_ZONE_ID CDN_VMESS_CF_ZONE_NAME NODE_NAME_CDN_VMESS \
@@ -1167,7 +907,7 @@ save_state() {
 has_vless_install() { [[ "${VLESS_ENABLED:-}" != "0" && -n "${UUID:-}" && -n "${PRIVATE_KEY:-}" && -n "${PUBLIC_KEY:-}" && -n "${SHORT_ID:-}" && -n "${VLESS_PORT:-}" ]]; }
 has_hy2_install() { [[ "${HY2_ENABLED:-}" != "0" && -n "${HY2_PORT:-}" && -n "${HY2_PASSWORD:-}" ]]; }
 has_anytls_install() { [[ "${ANYTLS_ENABLED:-}" != "0" && -n "${ANYTLS_PORT:-}" && -n "${ANYTLS_PASSWORD:-}" ]]; }
-has_ss2022_install() { return 1; }
+has_ss2022_install() { [[ "${SS2022_ENABLED:-}" != "0" && -n "${SS2022_PORT:-}" && -n "${SS2022_PASSWORD:-}" && -n "${SS2022_CIPHER:-}" ]]; }
 has_vmess_install() { [[ "${VMESS_ENABLED:-}" != "0" && -n "${VMESS_PORT:-}" && -n "${VMESS_UUID:-}" && -n "${VMESS_WS_PATH:-}" ]]; }
 has_tuic_install() { [[ "${TUIC_ENABLED:-}" != "0" && -n "${TUIC_PORT:-}" && -n "${TUIC_PASSWORD:-}" && -n "${TUIC_UUID:-}" ]]; }
 has_argo_install() { [[ "${ARGO_ENABLED:-}" != "0" && -n "${ARGO_LOCAL_PORT:-}" && -n "${ARGO_UUID:-}" && -n "${ARGO_WS_PATH:-}" ]]; }
@@ -1530,7 +1270,7 @@ write_sing_box_config() {
     --arg anytls_port "${ANYTLS_PORT:-}" \
     --arg anytls_password "${ANYTLS_PASSWORD:-}" \
     --arg anytls_tls_sni "${ANYTLS_TLS_SNI:-${DOMAIN:-}}" \
-    --arg ss2022_enabled "0" \
+    --arg ss2022_enabled "${SS2022_ENABLED:-0}" \
     --arg ss2022_port "${SS2022_PORT:-}" \
     --arg ss2022_cipher "${SS2022_CIPHER:-}" \
     --arg ss2022_password "${SS2022_PASSWORD:-}" \
@@ -2469,7 +2209,7 @@ install_ss2022_core() {
   resolve_ss2022_server_addr
   prompt_port SS2022_PORT "Shadowsocks" 50000 60000 1 || return
   generate_ss2022_password
-  SS2022_ENABLED="0"
+  SS2022_ENABLED="1"
   write_ss2022_config
   build_ss2022_share_files
   return 0
@@ -4640,7 +4380,7 @@ do_one_click_all() {
   
   if [[ -z "$custom_ports" ]]; then
     local _used_ports=() _p
-    for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
+    for _proto in HY2 SS2022 VMESS TUIC ANYTLS VLESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
         [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
@@ -4667,7 +4407,7 @@ do_one_click_all() {
   fi
 
   local _used_ports=() _port_var _port_val _new_port
-  for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT; do
+  for _port_var in HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT; do
     _port_val="${!_port_var:-}"
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
@@ -4718,7 +4458,7 @@ do_one_click_all() {
   HY2_ENABLED="1"
   VLESS_ENABLED="1"
   ANYTLS_ENABLED="1"  # 启用 AnyTLS（sing-box 1.11+ 支持 inbound）
-  SS2022_ENABLED="0"
+  SS2022_ENABLED="1"
   VMESS_ENABLED="1"
   TUIC_ENABLED="1"
   ARGO_ENABLED="1"
@@ -4813,7 +4553,7 @@ do_one_click_all() {
   echo "正在构建全协议分享文件..."
   build_client_files || true
   build_hysteria2_share_files || true
-  : # SS disabled
+  build_ss2022_share_files || true
   build_anytls_share_files || true
   build_vmess_share_files || true
   build_tuic_share_files || true
@@ -4850,7 +4590,11 @@ do_one_click_all() {
     echo "hysteria2://${e_auth}@${sip}:${HY2_PORT}/?sni=${e_sni_h}&insecure=${hy2_insecure}&allowInsecure=${hy2_insecure}&alpn=h3#${NODE_NAME_HY2}"
     echo ""
   fi
-
+  if [[ "${SS2022_ENABLED:-0}" == "1" ]]; then
+    echo "[Shadowsocks-2022]"
+    echo "ss://$(printf '%s' "${SS2022_CIPHER}:${SS2022_PASSWORD}" | base64 -w 0)@${sip}:${SS2022_PORT}#${NODE_NAME_SS2022}"
+    echo ""
+  fi
   if [[ "${ANYTLS_ENABLED:-0}" == "1" ]]; then
     local e_apass e_asni
     e_apass="$(urlenc "$ANYTLS_PASSWORD")"
@@ -5024,33 +4768,19 @@ do_one_click_all_with_cdn() {
   cyan "================ 一键全协议 + CDN 加速 ================"
 
   # ===== 第1步: UUID =====
-  if [[ "${CF_PROXY_REUSE_READY:-0}" == "1" && -n "${UUID:-}" ]]; then
-    sync_common_uuid
-    echo "UUID 已确认，继续使用: ${UUID}"
-  else
-    prompt_common_uuid
-  fi
+  prompt_common_uuid
 
   # ===== 第2步: 全局 CF Token =====
   echo ""
   cyan "--- Cloudflare API Token (全局) ---"
   echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS/Origin Rules"
-  if [[ "${CF_PROXY_REUSE_READY:-0}" == "1" && -n "${CF_API_TOKEN:-}" ]]; then
-    _global_cf_token="$CF_API_TOKEN"
-  elif [[ -n "${CF_API_TOKEN:-}" ]]; then
-    read -r -p "Cloudflare API Token [empty = use current token]: " _global_cf_token
-    _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -n "$_global_cf_token" ]] && CF_API_TOKEN="$_global_cf_token"
-  else
-    read -r -p "Cloudflare API Token: " _global_cf_token
-    _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    if [[ -z "$_global_cf_token" ]]; then
-      red "Cloudflare API Token is required."
-      return 1
-    fi
-    CF_API_TOKEN="$_global_cf_token"
+  read -r -p "请输入 Cloudflare API Token: " _global_cf_token
+  _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -z "$_global_cf_token" ]]; then
+    red "API Token 不能为空。"
+    return 1
   fi
-  _global_cf_token="$CF_API_TOKEN"
+  CF_API_TOKEN="$_global_cf_token"
   local token_len="${#_global_cf_token}"
   local token_tail="$_global_cf_token"
   if (( token_len > 6 )); then
@@ -5066,7 +4796,7 @@ do_one_click_all_with_cdn() {
 
   if [[ -z "$custom_ports" ]]; then
     local _used_ports=() _p
-    for _proto in HY2 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
+    for _proto in HY2 SS2022 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
         [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
@@ -5086,16 +4816,17 @@ do_one_click_all_with_cdn() {
   else
     IFS=',' read -r -a port_array <<< "$custom_ports"
     HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    SS2022_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[5]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
     CDN_VMESS_PORT="${port_array[6]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
   fi
 
   # 端口去重和冲突检测
   local _used_ports=() _port_var _port_val _new_port
-  for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
+  for _port_var in HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
     _port_val="${!_port_var:-}"
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
@@ -5116,6 +4847,7 @@ do_one_click_all_with_cdn() {
 
   NODE_NAME_VLESS="${node_prefix}-VLESS"
   NODE_NAME_HY2="${node_prefix}-HY2"
+  NODE_NAME_SS2022="${node_prefix}-SS2022"
   NODE_NAME_VMESS="${node_prefix}-VMess"
   NODE_NAME_TUIC="${node_prefix}-TUIC"
   NODE_NAME_ARGO="${node_prefix}-Argo"
@@ -5214,7 +4946,7 @@ do_one_click_all_with_cdn() {
   HY2_ENABLED="1"
   VLESS_ENABLED="1"
   ANYTLS_ENABLED="1"
-  SS2022_ENABLED="0"
+  SS2022_ENABLED="1"
   VMESS_ENABLED="1"
   TUIC_ENABLED="1"
   CDN_VMESS_ENABLED="1"
@@ -5311,7 +5043,7 @@ do_one_click_all_with_cdn() {
   echo "正在构建全协议分享文件..."
   build_client_files || true
   build_hysteria2_share_files || true
-  : # SS disabled
+  build_ss2022_share_files || true
   build_anytls_share_files || true
   build_vmess_share_files || true
   build_tuic_share_files || true
@@ -5343,10 +5075,9 @@ create_node_submenu() {
     cyan "================================================="
     cyan "             创建代理节点"
     cyan "================================================="
-    echo "  1) 一键生成所有标准协议 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo)"
+    echo "  1) 一键生成所有标准协议 (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo)"
     echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
-    echo "  3) 一键全协议+CDN (VLESS/HY2/VMess/TUIC/AnyTLS/Argo/CDN)"
-    echo "  4) Create CF proxy node"
+    echo "  3) 一键全协议+CDN (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo/CDN)"
     echo "  0) 返回主菜单"
     cyan "================================================="
     read -r -p "请输入对应的数字: " sub_choice
@@ -5370,13 +5101,6 @@ create_node_submenu() {
         if ! do_one_click_all_with_cdn; then
           red "一键全协议+CDN 安装失败。"
           echo "按回车键返回..."
-          read -r
-        fi
-        ;;
-      4)
-        if ! create_cf_proxy_node; then
-          red "Create CF proxy node failed."
-          echo "Press Enter to return..."
           read -r
         fi
         ;;
