@@ -477,6 +477,15 @@ cert_is_publicly_trusted() {
   rm -rf "$tmp_dir"
   return "$rc"
 }
+cert_is_cf_origin_ca() {
+  [[ -f "$SSL_DIR/fullchain.cer" ]] || return 1
+  openssl x509 -in "$SSL_DIR/fullchain.cer" -noout -issuer 2>/dev/null \
+    | grep -qi 'Cloudflare Origin'
+}
+cert_is_client_trusted() {
+  local verify_domain="${1:-${DOMAIN:-}}"
+  cert_is_publicly_trusted "$verify_domain" || cert_is_cf_origin_ca
+}
 cert_files_exist() { [[ -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; }
 detect_cert_primary_name() {
   local san cn
@@ -505,11 +514,11 @@ configure_domain_certificate() {
     if [[ ! "$use_existing" =~ ^[Nn]$ ]]; then
       DOMAIN="$cert_domain"
       SNI_VAL="$DOMAIN"
-      if cert_matches_domain && cert_is_currently_valid && cert_is_publicly_trusted "$DOMAIN"; then
+      if cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
         SELF_SIGN_CERT="0"
       else
         SELF_SIGN_CERT="1"
-        yellow "现有证书不是系统信任的公开证书或已过期，分享链接将使用 insecure=1。"
+        yellow "现有证书不是系统公开 CA/Cloudflare Origin CA，或已过期，分享链接将使用 insecure=1。"
       fi
       REALITY_SNI="${REALITY_SNI:-www.apple.com}"
       echo "已使用现有证书：${DOMAIN}"
@@ -520,11 +529,11 @@ configure_domain_certificate() {
   read -r -p "请输入域名(留空使用自签证书): " DOMAIN
   if [[ -n "$DOMAIN" ]]; then
     if cert_files_exist && cert_matches_domain; then
-      if cert_is_currently_valid && cert_is_publicly_trusted "$DOMAIN"; then
-        echo "检测到服务器已存在匹配 ${DOMAIN} 的公开可信证书，将直接使用。"
+      if cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
+        echo "检测到服务器已存在匹配 ${DOMAIN} 的公开可信证书或 Cloudflare Origin CA，将直接使用。"
         SELF_SIGN_CERT="0"
       else
-        yellow "检测到匹配 ${DOMAIN} 的证书，但它不是系统信任的公开证书或已过期。"
+        yellow "检测到匹配 ${DOMAIN} 的证书，但它不是系统公开 CA/Cloudflare Origin CA，或已过期。"
         yellow "将继续使用该证书，并在分享链接中启用 insecure=1。"
         SELF_SIGN_CERT="1"
       fi
@@ -807,7 +816,8 @@ cf_set_origin_port_rule() {
     yellow "创建 Origin Rules: ${cdn_domain} 回源端口 -> ${origin_port}"
   fi
 
-  data="$(printf '%s' "$merged_rules" | jq -c '{rules:.}')"
+  data="$(printf '%s' "$merged_rules" | jq -c \
+    '{name:"default",kind:"zone",phase:"http_request_origin",rules:.}')"
   cf_api_request PUT "$phase_endpoint" "$data" >/dev/null
 }
 
@@ -904,7 +914,7 @@ issue_cf_origin_certificate() {
   DOMAIN="$cert_domain"
   SNI_VAL="$cert_domain"
   REALITY_SNI="${REALITY_SNI:-$cert_domain}"
-  SELF_SIGN_CERT="1"
+  SELF_SIGN_CERT="0"
   USE_CF_ORIGIN_CA_CERT="1"
 }
 
@@ -5202,9 +5212,9 @@ do_one_click_all_with_cdn() {
   ANYTLS_PASSWORD="$SHARED_PASS"
 
   SS2022_CIPHER="2022-blake3-aes-128-gcm"
-  ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
-  VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
-  CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
+  [[ -n "${ARGO_WS_PATH:-}" ]] || ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
+  [[ -n "${VMESS_WS_PATH:-}" ]] || VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
+  [[ -n "${CDN_VMESS_WS_PATH:-}" ]] || CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
 
   if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
     VMESS_VIA_NGINX="1"
