@@ -4715,8 +4715,8 @@ do_one_click_all() {
 
   # 补全后续部署必需的参数
   SS2022_CIPHER="2022-blake3-aes-128-gcm"
-  ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
-  VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
+  [[ -n "${ARGO_WS_PATH:-}" ]] || ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
+  [[ -n "${VMESS_WS_PATH:-}" ]] || VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
   if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
     VMESS_VIA_NGINX="1"
     echo "检测到 EduPanel 站点和证书，VMess-WS 将通过 nginx 443 路径转发：${VMESS_WS_PATH}"
@@ -4779,6 +4779,9 @@ do_one_click_all() {
   echo ""
   echo "正在生成 sing-box VLESS Reality 密钥对..."
   generate_keys_and_ids || true
+  if [[ "${ARGO_ENABLED:-0}" == "1" ]]; then
+    generate_argo_identity
+  fi
 
   echo "正在写入主配置并拉起核心代理服务..."
   write_sing_box_config || return 1
@@ -5271,6 +5274,9 @@ do_one_click_all_with_cdn() {
   # 生成 VLESS Reality 密钥对
   echo "正在生成 sing-box VLESS Reality 密钥对..."
   generate_keys_and_ids || true
+  if [[ "${ARGO_ENABLED:-0}" == "1" ]]; then
+    generate_argo_identity
+  fi
 
   # CDN DNS + Origin Rules 配置
   echo ""
