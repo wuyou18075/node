@@ -839,12 +839,25 @@ cf_upsert_site_dns() {
 }
 
 issue_cf_dns_certificate() {
-  local cert_domain="$1" acme_bin="${HOME}/.acme.sh/acme.sh"
+  local cert_domain="$1" acme_bin="${HOME}/.acme.sh/acme.sh" acme_installer
   install_required_command curl || return 1
   mkdir -p "$SSL_DIR"
   if [[ ! -x "$acme_bin" ]]; then
     yellow "installing acme.sh..."
-    curl https://get.acme.sh | sh -s -- --force || return 1
+    acme_installer="$(mktemp /tmp/acme-install.XXXXXX.sh)" || return 1
+    if ! curl -fsSL https://get.acme.sh -o "$acme_installer"; then
+      rm -f "$acme_installer"
+      return 1
+    fi
+    if ! sh "$acme_installer" --force; then
+      if [[ -f "$acme_bin" ]]; then
+        sh "$acme_bin" --install --force || { rm -f "$acme_installer"; return 1; }
+      else
+        rm -f "$acme_installer"
+        return 1
+      fi
+    fi
+    rm -f "$acme_installer"
   fi
   [[ -x "$acme_bin" ]] || { red "acme.sh install failed"; return 1; }
   export CF_Token="$CF_API_TOKEN"
