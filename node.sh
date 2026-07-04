@@ -2667,8 +2667,12 @@ install_cloudflared_binary() {
 }
 
 generate_argo_identity() {
-  ARGO_UUID="$(generate_uuid_v4)"
-  ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
+  if [[ -n "${UUID:-}" ]]; then
+    ARGO_UUID="$UUID"
+  elif [[ -z "${ARGO_UUID:-}" ]]; then
+    ARGO_UUID="$(generate_uuid_v4)"
+  fi
+  [[ -n "${ARGO_WS_PATH:-}" ]] || ARGO_WS_PATH="/argo-$(openssl rand -hex 8)"
   if [[ -z "${ARGO_LOCAL_PORT:-}" ]]; then
     pick_argo_local_port
   fi
@@ -5066,7 +5070,7 @@ do_one_click_all_with_cdn() {
 
   if [[ -z "$custom_ports" ]]; then
     local _used_ports=() _p
-    for _proto in HY2 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
+    for _proto in HY2 SS2022 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
         [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
@@ -5086,16 +5090,17 @@ do_one_click_all_with_cdn() {
   else
     IFS=',' read -r -a port_array <<< "$custom_ports"
     HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    SS2022_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[5]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
     CDN_VMESS_PORT="${port_array[6]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
   fi
 
   # 端口去重和冲突检测
   local _used_ports=() _port_var _port_val _new_port
-  for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
+  for _port_var in HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
     _port_val="${!_port_var:-}"
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
