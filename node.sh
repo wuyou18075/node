@@ -849,7 +849,7 @@ issue_cf_dns_certificate() {
       rm -f "$acme_installer"
       return 1
     fi
-    if ! sh "$acme_installer" --force; then
+    if ! sh "$acme_installer" force; then
       if [[ -f "$acme_bin" ]]; then
         sh "$acme_bin" --install --force || { rm -f "$acme_installer"; return 1; }
       else
