@@ -844,7 +844,7 @@ issue_cf_dns_certificate() {
   mkdir -p "$SSL_DIR"
   if [[ ! -x "$acme_bin" ]]; then
     yellow "installing acme.sh..."
-    curl https://get.acme.sh | sh || return 1
+    curl https://get.acme.sh | sh -s -- --force || return 1
   fi
   [[ -x "$acme_bin" ]] || { red "acme.sh install failed"; return 1; }
   export CF_Token="$CF_API_TOKEN"
