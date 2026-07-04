@@ -838,39 +838,41 @@ cf_upsert_site_dns() {
   fi
 }
 
-issue_cf_dns_certificate() {
-  local cert_domain="$1" acme_bin="${HOME}/.acme.sh/acme.sh" acme_installer
+issue_cf_origin_certificate() {
+  local cert_domain="$1" csr_file response cert
   install_required_command curl || return 1
+  install_required_command jq || return 1
   mkdir -p "$SSL_DIR"
-  if [[ ! -x "$acme_bin" ]]; then
-    yellow "installing acme.sh..."
-    acme_installer="$(mktemp /tmp/acme-install.XXXXXX.sh)" || return 1
-    if ! curl -fsSL https://get.acme.sh -o "$acme_installer"; then
-      rm -f "$acme_installer"
-      return 1
-    fi
-    if ! sh "$acme_installer" force; then
-      if [[ -f "$acme_bin" ]]; then
-        sh "$acme_bin" --install --force || { rm -f "$acme_installer"; return 1; }
-      else
-        rm -f "$acme_installer"
-        return 1
-      fi
-    fi
-    rm -f "$acme_installer"
-  fi
-  [[ -x "$acme_bin" ]] || { red "acme.sh install failed"; return 1; }
-  export CF_Token="$CF_API_TOKEN"
-  "$acme_bin" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-  "$acme_bin" --issue --dns dns_cf -d "$cert_domain" --keylength ec-256 --force || return 1
-  "$acme_bin" --install-cert -d "$cert_domain" --ecc \
-    --fullchain-file "$SSL_DIR/fullchain.cer" \
-    --key-file "$SSL_DIR/private.key" \
-    --reloadcmd "systemctl reload nginx >/dev/null 2>&1 || true" || return 1
+
+  yellow "Issuing Cloudflare Origin CA certificate (15 years): ${cert_domain}"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$SSL_DIR/private.key" || return 1
+  chmod 600 "$SSL_DIR/private.key"
+
+  csr_file="$(mktemp /tmp/cf-origin-ca.XXXXXX.csr)" || return 1
+  openssl req -new -sha256 \
+    -key "$SSL_DIR/private.key" \
+    -subj "/CN=${cert_domain}" \
+    -addext "subjectAltName=DNS:${cert_domain}" \
+    -out "$csr_file" || { rm -f "$csr_file"; return 1; }
+
+  response="$(cf_api_request POST "/certificates" "$(jq -n \
+    --rawfile csr "$csr_file" \
+    --arg host "$cert_domain" \
+    '{hostnames:[$host],requested_validity:5475,request_type:"origin-ecc",csr:$csr}')")" || {
+    rm -f "$csr_file"
+    return 1
+  }
+  rm -f "$csr_file"
+
+  cert="$(printf '%s' "$response" | jq -r '.result.certificate // empty')"
+  [[ -n "$cert" ]] || { red "Cloudflare Origin CA certificate response is empty."; return 1; }
+  printf '%s\n' "$cert" > "$SSL_DIR/fullchain.cer"
+  chmod 644 "$SSL_DIR/fullchain.cer"
+
   DOMAIN="$cert_domain"
   SNI_VAL="$cert_domain"
   REALITY_SNI="${REALITY_SNI:-$cert_domain}"
-  SELF_SIGN_CERT="0"
+  SELF_SIGN_CERT="1"
 }
 
 prepare_cf_proxy_mask_site() {
@@ -918,10 +920,10 @@ prepare_cf_proxy_mask_site() {
       read -r -p "Input mask site domain: " site_domain
       site_domain="$(normalize_argo_host "$site_domain")"
       [[ -n "$site_domain" ]] || { red "site domain is required"; return 1; }
-      yellow "Upserting CF DNS A record (DNS only): ${site_domain} -> ${vps_ip}"
-      cf_upsert_site_dns "$site_domain" "$vps_ip" false || return 1
-      yellow "Issuing certificate by CF DNS: ${site_domain}"
-      issue_cf_dns_certificate "$site_domain" || return 1
+      yellow "Upserting CF DNS A record (proxied): ${site_domain} -> ${vps_ip}"
+      cf_upsert_site_dns "$site_domain" "$vps_ip" true || return 1
+      yellow "Issuing Cloudflare Origin CA certificate (15 years): ${site_domain}"
+      issue_cf_origin_certificate "$site_domain" || return 1
       SITE_ENABLED="1"
       SITE_DOMAIN="$site_domain"
       SITE_BRAND="${SITE_BRAND:-EduPanel}"
