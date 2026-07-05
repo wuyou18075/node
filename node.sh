@@ -33,7 +33,10 @@ SUBSCRIPTION_DIR="/var/www/subscription"
 CONFIG_DIR="/etc/agsb"
 NODE_CONFIG_FILE="${NODE_CONFIG_FILE:-${CONFIG_DIR}/node.config}"
 SUB_NGINX_AUTH_FILE="${SUB_NGINX_AUTH_FILE:-/etc/nginx/.agsb-subscription.htpasswd}"
-INSTALL_SCRIPT="$(realpath "$0")"
+NODE_SCRIPT_URL="${NODE_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/node.sh}"
+SELF_SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SELF_INSTALL_SCRIPT="${SELF_INSTALL_SCRIPT:-/usr/local/bin/agsb-node.sh}"
+INSTALL_SCRIPT="${INSTALL_SCRIPT:-$SELF_INSTALL_SCRIPT}"
 MASK_SITE_SCRIPT_URL="${MASK_SITE_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/mask-site.sh}"
 SUBSCRIPTION_LINK_SCRIPT_URL="${SUBSCRIPTION_LINK_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/subscription-link.sh}"
 
@@ -1456,7 +1459,49 @@ detect_running_argo_tunnel() {
 
   return 0
 }
-install_self_script() { :; }
+
+install_self_script() {
+  local src="${BASH_SOURCE[0]:-${SELF_SCRIPT_SOURCE:-$0}}" target="${INSTALL_SCRIPT:-$SELF_INSTALL_SCRIPT}" tmp
+
+  [[ "$target" == /* ]] || target="$SELF_INSTALL_SCRIPT"
+  mkdir -p "$(dirname "$target")" || return 1
+
+  if [[ -r "$src" ]] && grep -q '^# node.sh - Node generation:' "$src" 2>/dev/null; then
+    if [[ "$src" != "$target" ]]; then
+      install -m 0755 "$src" "$target" || return 1
+    fi
+    INSTALL_SCRIPT="$target"
+    return 0
+  fi
+
+  if [[ -r "${SELF_SCRIPT_SOURCE:-}" ]] && grep -q '^# node.sh - Node generation:' "$SELF_SCRIPT_SOURCE" 2>/dev/null; then
+    if [[ "$SELF_SCRIPT_SOURCE" != "$target" ]]; then
+      install -m 0755 "$SELF_SCRIPT_SOURCE" "$target" || return 1
+    fi
+    INSTALL_SCRIPT="$target"
+    return 0
+  fi
+
+  if [[ -r "$target" ]] && grep -q '^# node.sh - Node generation:' "$target" 2>/dev/null; then
+    INSTALL_SCRIPT="$target"
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || {
+    red "无法安装 systemd 所需脚本: 当前脚本源不可读且缺少 curl。"
+    return 1
+  }
+  tmp="$(mktemp /tmp/agsb-node.XXXXXX.sh)" || return 1
+  if ! curl_fsSL "$NODE_SCRIPT_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    red "无法下载 systemd 所需脚本: ${NODE_SCRIPT_URL}"
+    return 1
+  fi
+  install -m 0755 "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  INSTALL_SCRIPT="$target"
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     red "请使用 root 权限运行：sudo bash $INSTALL_SCRIPT"
@@ -3613,13 +3658,36 @@ wait_tcp_endpoint() {
   return 1
 }
 
+print_argo_service_diagnostics() {
+  local lines="${1:-80}"
+
+  yellow "cloudflared.service 启动失败，最近诊断信息如下："
+  systemctl status "$ARGO_SERVICE" --no-pager -l 2>/dev/null || true
+  journalctl -u "$ARGO_SERVICE" -n "$lines" --no-pager 2>/dev/null || true
+  if [[ -s "$ARGO_BOOT_LOG" ]]; then
+    yellow "cloudflared 日志尾部: ${ARGO_BOOT_LOG}"
+    tail -n "$lines" "$ARGO_BOOT_LOG" 2>/dev/null || true
+  fi
+}
+
+restart_argo_service_or_report() {
+  local timeout_sec="${1:-60}"
+
+  if timeout "$timeout_sec" systemctl restart "$ARGO_SERVICE"; then
+    return 0
+  fi
+
+  print_argo_service_diagnostics
+  return 1
+}
+
 write_argo_service() {
   local description edge_arg="" exec_start
   normalize_argo_tuning
   normalize_argo_tunnel_state
   mkdir -p "$STATE_DIR"
   rm -f "${STATE_DIR}/argo.env"
-  install_self_script || true
+  install_self_script || return 1
 
   if [[ "${ARGO_EDGE_IP_VERSION:-auto}" != "auto" ]]; then
     edge_arg=" --edge-ip-version ${ARGO_EDGE_IP_VERSION}"
@@ -3660,7 +3728,7 @@ write_argo_service() {
 }
 
 write_argo_refresh_units() {
-  install_self_script || true
+  install_self_script || return 1
 
   printf '%s\n' \
     "[Unit]" \
@@ -3749,7 +3817,7 @@ ensure_argo_quick_service() {
     systemctl daemon-reload
     systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
     enable_argo_refresh_automation
-    timeout 60 systemctl restart "$ARGO_SERVICE" || yellow "Argo 服务重启超时，请稍后手动检查。"
+    restart_argo_service_or_report 60 || yellow "Argo 服务重启失败，请根据上方日志检查。"
     ARGO_DOMAIN=""
     refresh_argo_domain || true
   fi
@@ -3956,7 +4024,7 @@ restart_argo_with_tuning() {
   write_argo_service
   systemctl daemon-reload
   enable_argo_refresh_automation
-  timeout 60 systemctl restart "$ARGO_SERVICE" || { yellow "Argo 服务重启超时"; return 1; }
+  restart_argo_service_or_report 60 || { yellow "Argo 服务重启失败"; return 1; }
   refresh_argo_domain "$domain_attempts"
 }
 
@@ -4219,7 +4287,7 @@ install_argo_core() {
   systemctl daemon-reload
   systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
   enable_argo_refresh_automation
-  timeout 60 systemctl restart "$ARGO_SERVICE" || { red "Argo 服务启动失败。"; return 1; }
+  restart_argo_service_or_report 60 || { red "Argo 服务启动失败。"; return 1; }
 
   if ! refresh_argo_domain; then
     if argo_is_named_tunnel; then
@@ -4417,7 +4485,7 @@ refresh_argo_subscription_once() {
   old_domain="${ARGO_DOMAIN:-}"
 
   if [[ "$mode" == "manual" ]]; then
-    install_self_script || true
+    install_self_script || return 1
     if [[ ! -f "/etc/systemd/system/${ARGO_SERVICE}" ]]; then
       write_argo_service
       systemctl daemon-reload
@@ -4425,7 +4493,7 @@ refresh_argo_subscription_once() {
     systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
     enable_argo_refresh_automation
     if ! systemctl is-active --quiet "$ARGO_SERVICE"; then
-      timeout 60 systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1 || true
+      restart_argo_service_or_report 60 || true
     fi
   fi
 
@@ -5378,7 +5446,7 @@ write_subscription_service() {
   fi
 
   if has_argo_install; then
-    install_self_script || true
+    install_self_script || return 1
     argo_after=" ${ARGO_SERVICE}"
     argo_wants=" ${ARGO_SERVICE}"
     argo_prestart="ExecStartPre=-/bin/bash ${INSTALL_SCRIPT} --refresh-argo-subscription request"
@@ -5692,7 +5760,7 @@ do_one_click_all() {
   enable_argo_refresh_automation
   echo ""
   echo "正在启动 cloudflared 服务..."
-  if systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1; then
+  if restart_argo_service_or_report 60; then
     if refresh_argo_domain 8 && wait_argo_ws_reachable 12; then
       if argo_is_named_tunnel; then
         green "✓ Cloudflare Argo 固定隧道启动成功！域名: ${ARGO_DOMAIN}"
@@ -5807,7 +5875,7 @@ switch_to_fixed_tunnel() {
     echo "正在重写 Argo 隧道服务并尝试重启..."
     write_argo_service
     systemctl daemon-reload
-    timeout 60 systemctl restart "$ARGO_SERVICE" || yellow "Argo 服务重启超时，请稍后手动检查。"
+    restart_argo_service_or_report 60 || yellow "Argo 服务重启失败，请根据上方日志检查。"
     refresh_argo_domain 15 || true
     build_argo_share_files "0" || true
     refresh_subscription_service
@@ -6325,7 +6393,7 @@ do_one_click_all_with_cdn() {
     systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
     enable_argo_refresh_automation
     echo "正在启动 cloudflared..."
-    if systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1; then
+    if restart_argo_service_or_report 60; then
       if refresh_argo_domain 8 && wait_argo_ws_reachable 12; then
         green "Argo 隧道启动成功！域名: ${ARGO_DOMAIN}"
       else
