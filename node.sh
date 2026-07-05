@@ -6294,10 +6294,10 @@ main_menu() {
           yellow "已取消卸载。"
         else
           if uninstall_all; then
-            read -r -p "是否清空 node.config? [y/N]: " confirm
+            read -r -p "是否删除 node.config? [y/N]: " confirm
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
-              clear_node_config_file
-              green "node.config 已清空。"
+              rm -f "$NODE_CONFIG_FILE"
+              green "node.config 已删除。"
             else
               yellow "保留 node.config。"
             fi

@@ -23,18 +23,18 @@ if ! grep -Fq 'if [[ ! "$confirm" =~ ^[Yy]$ ]]; then' "$script"; then
   exit 1
 fi
 
-if ! grep -q '是否清空 node.config? \[y/N\]' "$script"; then
-  echo "menu item 99 must ask whether to clear node.config with default no" >&2
+if ! grep -q '是否删除 node.config? \[y/N\]' "$script"; then
+  echo "menu item 99 must ask whether to delete node.config with default no" >&2
   exit 1
 fi
 
 if ! grep -Fq 'if [[ "$confirm" =~ ^[Yy]$ ]]; then' "$script"; then
-  echo "menu item 99 must only clear node.config when the user explicitly answers y/Y" >&2
+  echo "menu item 99 must only delete node.config when the user explicitly answers y/Y" >&2
   exit 1
 fi
 
-if ! grep -q '^clear_node_config_file()' "$script"; then
-  echo "script must provide a reusable node.config clear helper" >&2
+if ! grep -Fq 'rm -f "$NODE_CONFIG_FILE"' "$script"; then
+  echo "menu item 99 must delete node.config instead of truncating it" >&2
   exit 1
 fi
 
