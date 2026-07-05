@@ -30,6 +30,8 @@ SITE_ROOT="/var/www/edupanel"
 NGINX_SITE_CONF="/etc/nginx/conf.d/agsb-edupanel.conf"
 ARGO_BOOT_LOG="/var/log/cloudflared.log"
 SUBSCRIPTION_DIR="/var/www/subscription"
+CONFIG_DIR="/etc/agsb"
+NODE_CONFIG_FILE="${NODE_CONFIG_FILE:-${CONFIG_DIR}/node.config}"
 INSTALL_SCRIPT="$(realpath "$0")"
 MASK_SITE_SCRIPT_URL="${MASK_SITE_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/mask-site.sh}"
 
@@ -661,7 +663,8 @@ run_remote_mask_site_script() {
     return 1
   fi
 
-  if [[ "${USE_CF_ORIGIN_CA_CERT:-0}" == "1" ]]; then
+  auto_domain="${SITE_DOMAIN:-${DOMAIN:-}}"
+  if [[ "${USE_CF_ORIGIN_CA_CERT:-0}" == "1" || ( "$action" == "deploy" && -n "$auto_domain" ) ]]; then
     patched_script="${tmp_script}.patched"
     awk '
       /if cert_matches_domain "\$\{SSL_DIR\}\/fullchain\.cer" "\$SITE_DOMAIN" && cert_is_valid/ {
@@ -684,7 +687,6 @@ run_remote_mask_site_script() {
     ' "$tmp_script" > "$patched_script" && mv "$patched_script" "$tmp_script"
   fi
 
-  auto_domain="${SITE_DOMAIN:-${DOMAIN:-}}"
   if [[ "$action" == "deploy" && -n "$auto_domain" ]]; then
     printf '\n' | \
       SITE_DOMAIN="$auto_domain" DOMAIN="$auto_domain" SNI_VAL="${SNI_VAL:-$auto_domain}" \
@@ -1298,6 +1300,244 @@ require_root() {
     return 1
   fi
 }
+
+load_node_config() {
+  local f="${NODE_CONFIG_FILE}"
+  [[ -f "$f" ]] || return 1
+  while IFS='=' read -r k v; do
+    [[ -z "$k" || "$k" == "#"* ]] && continue
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "$k" in
+      UUID|CF_API_TOKEN|DOMAIN|NODE_PREFIX|ARGO_FIXED_DOMAIN|CDN_VMESS_CDN_DOMAIN|\
+      HY2_PORT|SS2022_PORT|VMESS_PORT|TUIC_PORT|ANYTLS_PORT|VLESS_PORT|CDN_VMESS_PORT|SUB_PORT)
+        declare -g "${k}=${v}"
+        ;;
+    esac
+  done < "$f"
+  return 0
+}
+
+save_node_config() {
+  local f="${NODE_CONFIG_FILE}" tmp var val
+  mkdir -p "$CONFIG_DIR"
+  tmp="${f}.tmp"
+  : > "$tmp"
+  printf '# AGSB reusable input config\n' >> "$tmp"
+  printf '# This file is kept when menu 99 uninstalls generated services and data.\n' >> "$tmp"
+  for var in UUID CF_API_TOKEN DOMAIN NODE_PREFIX ARGO_FIXED_DOMAIN CDN_VMESS_CDN_DOMAIN \
+             HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT SUB_PORT; do
+    val="${!var:-}"
+    [[ -n "$val" ]] && printf '%s=%s\n' "$var" "$val" >> "$tmp"
+  done
+  install -m 0600 "$tmp" "$f" 2>/dev/null || mv -f "$tmp" "$f"
+  rm -f "$tmp"
+}
+
+show_node_config_path() {
+  if [[ -f "$NODE_CONFIG_FILE" ]]; then
+    echo "   配置文件: ${NODE_CONFIG_FILE} (存在)"
+  else
+    echo "   配置文件: ${NODE_CONFIG_FILE} (未创建)"
+  fi
+}
+
+config_value_label() {
+  local var="$1" val="${!1:-}" len tail
+  if [[ "$var" == "CF_API_TOKEN" && -n "$val" ]]; then
+    len="${#val}"
+    tail="$val"
+    (( len > 6 )) && tail="${val: -6}"
+    printf '长度 %s，结尾 %s\n' "$len" "$tail"
+  else
+    printf '%s\n' "$val"
+  fi
+}
+
+confirm_reuse_config_value() {
+  local var="$1" label="$2" use_previous
+  [[ -n "${!var:-}" ]] || return 1
+  echo "检测到 node.config 中的${label}: $(config_value_label "$var")"
+  read -r -p "是否复用该${label}? [Y/n]: " use_previous
+  [[ "$use_previous" =~ ^[Nn]$ ]] && return 1
+  return 0
+}
+
+recommend_argo_domain() {
+  local base="$1"
+  [[ -n "$base" ]] || return 1
+  printf 'argo.%s\n' "$base"
+}
+
+recommend_cdn_domain() {
+  local base="$1"
+  [[ -n "$base" ]] || return 1
+  printf 'cdn.%s\n' "$base"
+}
+
+generate_self_signed_domain_cert() {
+  local cert_domain="${1:-www.apple.com}"
+  mkdir -p "$SSL_DIR"
+  openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
+    -keyout "$SSL_DIR/private.key" -out "$SSL_DIR/fullchain.cer" \
+    -days 3650 -subj "/CN=${cert_domain}" -addext "subjectAltName=DNS:${cert_domain}" 2>/dev/null
+}
+
+configure_domain_certificate_with_config() {
+  local input_domain use_existing vps_ip
+
+  if confirm_reuse_config_value DOMAIN "主域名"; then
+    input_domain="$DOMAIN"
+  else
+    read -r -p "请输入域名(留空使用自签证书): " input_domain
+    input_domain="$(normalize_argo_host "${input_domain:-}")"
+  fi
+
+  if [[ -z "$input_domain" ]]; then
+    DOMAIN=""
+    SNI_VAL="www.apple.com"
+    REALITY_SNI="${REALITY_SNI:-$SNI_VAL}"
+    SELF_SIGN_CERT="1"
+    echo "未绑定域名，已为您生成自签证书，SNI 将使用：$SNI_VAL"
+    generate_self_signed_domain_cert "$SNI_VAL" || return 1
+    return 0
+  fi
+
+  DOMAIN="$input_domain"
+  SNI_VAL="$DOMAIN"
+  REALITY_SNI="${REALITY_SNI:-$DOMAIN}"
+  SITE_DOMAIN="$DOMAIN"
+
+  if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
+    SELF_SIGN_CERT="0"
+    echo "检测到服务器已存在匹配 ${DOMAIN} 的可用证书，将直接使用。"
+    return 0
+  fi
+
+  yellow "未检测到匹配 ${DOMAIN} 的可用证书，将尝试自动配置 Cloudflare DNS 并申请证书。"
+  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  if [[ -z "$vps_ip" ]]; then
+    read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
+    [[ -n "$vps_ip" ]] || { red "VPS IP 不能为空。"; return 1; }
+  fi
+
+  if [[ -n "${CF_API_TOKEN:-}" ]]; then
+    yellow "正在添加/更新主域名 DNS A 记录: ${DOMAIN} -> ${vps_ip} (灰云)"
+    cf_upsert_site_dns "$DOMAIN" "$vps_ip" false || return 1
+  else
+    yellow "未配置 Cloudflare API Token，跳过 DNS 自动配置；请确认 ${DOMAIN} 已解析到 ${vps_ip}。"
+  fi
+
+  SITE_ENABLED="1"
+  USE_CF_ORIGIN_CA_CERT="0"
+  save_state
+  install_mask_site_nginx || return 1
+  if cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
+    SELF_SIGN_CERT="0"
+    echo "证书已申请并同步到 ${SSL_DIR}。"
+  else
+    red "证书申请后仍未检测到 ${DOMAIN} 的可用证书。"
+    return 1
+  fi
+}
+
+apply_node_prefix() {
+  local prefix="${1:-$(hostname)}"
+  NODE_PREFIX="$prefix"
+  NODE_NAME_VLESS="${prefix}-VLESS"
+  NODE_NAME_HY2="${prefix}-HY2"
+  NODE_NAME_SS2022="${prefix}-SS2022"
+  NODE_NAME_VMESS="${prefix}-VMess"
+  NODE_NAME_TUIC="${prefix}-TUIC"
+  NODE_NAME_ARGO="${prefix}-Argo"
+  NODE_NAME_ANYTLS="${prefix}-AnyTLS"
+  NODE_NAME_CDN_VMESS="${prefix}-CDN"
+}
+
+prompt_node_prefix_with_config() {
+  local node_prefix
+  if confirm_reuse_config_value NODE_PREFIX "节点名前缀"; then
+    apply_node_prefix "$NODE_PREFIX"
+    return 0
+  fi
+  read -r -p "请输入节点名前缀 (留空使用主机名 $(hostname)): " node_prefix
+  node_prefix="${node_prefix:-$(hostname)}"
+  apply_node_prefix "$node_prefix"
+}
+
+manage_node_config_menu() {
+  local choice confirm
+  while true; do
+    clear
+    cyan "================================================="
+    cyan "                 配置文件管理"
+    cyan "================================================="
+    show_node_config_path
+    echo "  1) 查看 node.config"
+    echo "  2) 清空 node.config"
+    echo "  3) 删除 node.config"
+    echo "  4) 清空 node.config 和运行状态"
+    echo "  0) 返回主菜单"
+    cyan "================================================="
+    read -r -p "请输入对应的数字: " choice
+    case "$choice" in
+      1)
+        if [[ -f "$NODE_CONFIG_FILE" ]]; then
+          sed -n '1,200p' "$NODE_CONFIG_FILE"
+        else
+          yellow "node.config 尚未创建。"
+        fi
+        echo "按回车键返回..."
+        read -r
+        ;;
+      2)
+        require_root || return 1
+        read -r -p "确认清空 node.config? (请输入 YES 确认): " confirm
+        if [[ "$confirm" == "YES" ]]; then
+          mkdir -p "$CONFIG_DIR"
+          : > "$NODE_CONFIG_FILE"
+          chmod 600 "$NODE_CONFIG_FILE" 2>/dev/null || true
+          green "node.config 已清空。"
+        else
+          yellow "已取消。"
+        fi
+        echo "按回车键返回..."
+        read -r
+        ;;
+      3)
+        require_root || return 1
+        read -r -p "确认删除 node.config? (请输入 YES 确认): " confirm
+        if [[ "$confirm" == "YES" ]]; then
+          rm -f "$NODE_CONFIG_FILE"
+          green "node.config 已删除。"
+        else
+          yellow "已取消。"
+        fi
+        echo "按回车键返回..."
+        read -r
+        ;;
+      4)
+        require_root || return 1
+        read -r -p "确认清空 node.config 和 ${STATE_DIR}/node-state.env? (请输入 YES 确认): " confirm
+        if [[ "$confirm" == "YES" ]]; then
+          rm -f "$NODE_CONFIG_FILE" "${STATE_DIR}/node-state.env"
+          green "node.config 和运行状态已清空。"
+        else
+          yellow "已取消。"
+        fi
+        echo "按回车键返回..."
+        read -r
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        red "无效输入。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 load_state() {
   local f="${STATE_DIR}/node-state.env"
   [[ -f "$f" ]] || return 1
@@ -4930,6 +5170,7 @@ refresh_subscription_service() {
 do_one_click_all() {
   clear
   load_state >/dev/null 2>&1 || true
+  load_node_config >/dev/null 2>&1 || true
   cyan "================ 一键生成所有标准协议 ================"
   
   # 1. 引导获取 UUID
@@ -4986,16 +5227,8 @@ do_one_click_all() {
 
   # 4. 获取节点名称前缀
   echo ""
-  read -r -p "请输入节点名前缀 (留空默认使用服务器主机名 $(hostname)): " node_prefix
-  node_prefix="${node_prefix:-$(hostname)}"
+  prompt_node_prefix_with_config
   
-  NODE_NAME_VLESS="${node_prefix}-VLESS"
-  NODE_NAME_HY2="${node_prefix}-HY2"
-  NODE_NAME_SS2022="${node_prefix}-SS2022"
-  NODE_NAME_VMESS="${node_prefix}-VMess"
-  NODE_NAME_TUIC="${node_prefix}-TUIC"
-  NODE_NAME_ARGO="${node_prefix}-Argo"
-
   # 5. 生成 24 位随机密码
   SHARED_PASS="$(openssl rand -hex 12)"
   HY2_PASSWORD="$SHARED_PASS"
@@ -5015,7 +5248,6 @@ do_one_click_all() {
   HY2_PORT_RANGE=""  # 端口跳跃留空，仅使用单端口
   HY2_OBFS_ENABLED="0"
   HY2_OBFS_PASSWORD=""
-  NODE_NAME_ANYTLS="${node_prefix}-AnyTLS"
   select_argo_edge_server
   
   HY2_ENABLED="1"
@@ -5131,6 +5363,7 @@ do_one_click_all() {
   install_subscription_service || true
 
   save_state
+  save_node_config
 
   green "一键安装全标准协议结束！配置信息如下："
   echo ""
@@ -5343,6 +5576,7 @@ do_one_click_all_with_cdn() {
 
   clear
   load_state >/dev/null 2>&1 || true
+  load_node_config >/dev/null 2>&1 || true
   SUB_CF_PROXY="$cf_proxy"
   cyan "================ ${mode_title} ================"
   echo "$mode_note"
@@ -5386,7 +5620,11 @@ do_one_click_all_with_cdn() {
   fi
   echo "Token 已读取: 长度 ${token_len}，结尾 ${token_tail}"
 
-  # ===== 第3步: 端口分配（7个协议: HY2/SS/VMess/TUIC/AnyTLS/VLESS + CDN-VMess） =====
+  # ===== 第3步: 主域名和证书 =====
+  echo ""
+  configure_domain_certificate_with_config || return 1
+
+  # ===== 第4步: 端口分配（7个协议: HY2/SS/VMess/TUIC/AnyTLS/VLESS + CDN-VMess） =====
   echo ""
   echo "本次安装将包含以下 7 个需要端口的协议:"
   echo "1.Hysteria2 2.SS-2022 3.VMess 4.TUIC 5.AnyTLS 6.VLESS 7.CDN-VMess"
@@ -5434,29 +5672,23 @@ do_one_click_all_with_cdn() {
     _used_ports+=("$_port_val")
   done
 
-  # ===== 第4步: 域名和证书 =====
-  echo ""
-  configure_domain_certificate
-
   # ===== 第5步: 节点名前缀 =====
   echo ""
-  read -r -p "请输入节点名前缀 (留空使用主机名 $(hostname)): " node_prefix
-  node_prefix="${node_prefix:-$(hostname)}"
-
-  NODE_NAME_VLESS="${node_prefix}-VLESS"
-  NODE_NAME_HY2="${node_prefix}-HY2"
-  NODE_NAME_VMESS="${node_prefix}-VMess"
-  NODE_NAME_TUIC="${node_prefix}-TUIC"
-  NODE_NAME_ARGO="${node_prefix}-Argo"
-  NODE_NAME_ANYTLS="${node_prefix}-AnyTLS"
-  NODE_NAME_CDN_VMESS="${node_prefix}-CDN"
+  prompt_node_prefix_with_config
 
   # ===== 第6步: Argo 隧道域名 =====
   echo ""
   cyan "--- Argo 隧道配置 ---"
   echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
   echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
-  read -r -p "请输入 Argo 隧道域名 (如 tunnel.example.com): " argo_domain_input
+  local recommended_argo_domain
+  recommended_argo_domain="${ARGO_FIXED_DOMAIN:-$(recommend_argo_domain "${DOMAIN:-}" 2>/dev/null || true)}"
+  if [[ -n "$recommended_argo_domain" ]]; then
+    read -r -p "请输入 Argo 隧道域名 [默认 ${recommended_argo_domain}，输入 0 跳过]: " argo_domain_input
+    argo_domain_input="${argo_domain_input:-$recommended_argo_domain}"
+  else
+    read -r -p "请输入 Argo 隧道域名 (如 tunnel.example.com): " argo_domain_input
+  fi
   argo_domain_input="$(printf '%s' "${argo_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
 
   if [[ "$argo_domain_input" == "0" ]]; then
@@ -5487,7 +5719,14 @@ do_one_click_all_with_cdn() {
   # ===== 第7步: CDN 加速域名 =====
   echo ""
   cyan "--- CDN+VMess+WS 配置 ---"
-  read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
+  local recommended_cdn_domain
+  recommended_cdn_domain="${CDN_VMESS_CDN_DOMAIN:-$(recommend_cdn_domain "${DOMAIN:-}" 2>/dev/null || true)}"
+  if [[ -n "$recommended_cdn_domain" ]]; then
+    read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
+    cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
+  else
+    read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
+  fi
   cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
   if [[ -z "$cdn_domain_input" ]]; then
     red "CDN 域名不能为空。"
@@ -5670,6 +5909,7 @@ do_one_click_all_with_cdn() {
   install_subscription_service || true
 
   save_state
+  save_node_config
 
   green "${mode_title} 安装完成！"
   echo ""
@@ -5751,6 +5991,7 @@ create_node_submenu() {
 main_menu() {
   while true; do
     load_state >/dev/null 2>&1 || true
+    load_node_config >/dev/null 2>&1 || true
     clear
     cyan "================================================="
     cyan "             节点配置与订阅管理面板"
@@ -5777,6 +6018,7 @@ main_menu() {
     detect_sing_box_version
     sb_latest="$SING_BOX_VERSION"
     echo "   sing-box: ${sb_ver}(${sb_status})    官网最新版本: ${sb_latest}"
+    show_node_config_path
     echo "  1  安装 sing-box"
     echo "  2  装站点且 nginx 代理"
     echo "  3) 创建代理节点"
@@ -5784,6 +6026,7 @@ main_menu() {
     echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
+    echo "  90 配置文件管理"
     echo "  98 更新sing-box 版本"
     echo "  99 卸载所有脚本产出内容"
     echo "  0) 退出脚本"
@@ -5832,6 +6075,9 @@ main_menu() {
         show_node_info
         echo "按回车键返回主菜单..."
         read -r
+        ;;
+      90)
+        manage_node_config_menu
         ;;
       98)
         yellow "正在更新 sing-box 版本..."
