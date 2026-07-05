@@ -1446,6 +1446,21 @@ recommend_cdn_domain() {
   recommend_cf_edge_domain cdn "$1"
 }
 
+recommend_saved_or_cf_edge_domain() {
+  local saved="$1" prefix="$2" base="$3" recommended
+  recommended="$(recommend_cf_edge_domain "$prefix" "$base" 2>/dev/null || true)"
+  if [[ -n "$saved" && -n "$base" && -n "$recommended" && "$saved" == *".${base}" && "$saved" != "$recommended" ]]; then
+    printf '%s\n' "$recommended"
+    return 0
+  fi
+  if [[ -n "$saved" ]]; then
+    printf '%s\n' "$saved"
+    return 0
+  fi
+  [[ -n "$recommended" ]] || return 1
+  printf '%s\n' "$recommended"
+}
+
 generate_self_signed_domain_cert() {
   local cert_domain="${1:-www.apple.com}"
   mkdir -p "$SSL_DIR"
@@ -5758,7 +5773,7 @@ do_one_click_all_with_cdn() {
   echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
   echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
   local recommended_argo_domain
-  recommended_argo_domain="${ARGO_FIXED_DOMAIN:-$(recommend_argo_domain "${DOMAIN:-}" 2>/dev/null || true)}"
+  recommended_argo_domain="$(recommend_saved_or_cf_edge_domain "${ARGO_FIXED_DOMAIN:-}" argo "${DOMAIN:-}" 2>/dev/null || true)"
   if [[ -n "$recommended_argo_domain" ]]; then
     read -r -p "请输入 Argo 隧道域名 [默认 ${recommended_argo_domain}，输入 0 跳过]: " argo_domain_input
     argo_domain_input="${argo_domain_input:-$recommended_argo_domain}"
@@ -5796,7 +5811,7 @@ do_one_click_all_with_cdn() {
   echo ""
   cyan "--- CDN+VMess+WS 配置 ---"
   local recommended_cdn_domain
-  recommended_cdn_domain="${CDN_VMESS_CDN_DOMAIN:-$(recommend_cdn_domain "${DOMAIN:-}" 2>/dev/null || true)}"
+  recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "${CDN_VMESS_CDN_DOMAIN:-}" cdn "${DOMAIN:-}" 2>/dev/null || true)"
   if [[ -n "$recommended_cdn_domain" ]]; then
     read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
     cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"

@@ -17,6 +17,16 @@ ARGO_CF_ZONE_NAME="cj7.kdns.fr"
   exit 1
 }
 
+[[ "$(recommend_saved_or_cf_edge_domain "argo.gf7.cj7.kdns.fr" argo "gf7.cj7.kdns.fr")" == "argo-gf7.cj7.kdns.fr" ]] || {
+  echo "saved legacy Argo subdomain must be replaced by a Cloudflare edge-safe recommendation" >&2
+  exit 1
+}
+
+[[ "$(recommend_saved_or_cf_edge_domain "tunnel.cj7.kdns.fr" argo "gf7.cj7.kdns.fr")" == "tunnel.cj7.kdns.fr" ]] || {
+  echo "custom saved Argo domains must be preserved" >&2
+  exit 1
+}
+
 ARGO_CF_ZONE_NAME=""
 
 [[ "$(recommend_argo_domain "aaa.bbb.com")" == "argo.aaa.bbb.com" ]] || {
