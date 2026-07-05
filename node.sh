@@ -5310,6 +5310,12 @@ uninstall_all() {
   rm -f "$NGINX_SITE_CONF"
   rm -f "$ARGO_BOOT_LOG"
   rm -f /etc/sysctl.d/99-agsb-proxy-tuning.conf
+  if [[ -n "${SITE_DOMAIN:-}" ]]; then
+    rm -rf "/etc/letsencrypt/live/${SITE_DOMAIN}"
+    rm -rf "/etc/letsencrypt/archive/${SITE_DOMAIN}"
+    rm -f "/etc/letsencrypt/renewal/${SITE_DOMAIN}.conf"
+    rm -f "/etc/letsencrypt/renewal-hooks/deploy/agsb-copy-${SITE_DOMAIN}.sh"
+  fi
   if command -v nginx >/dev/null 2>&1; then
     nginx -t >/dev/null 2>&1 && (systemctl reload nginx >/dev/null 2>&1 || true)
   fi
@@ -5321,7 +5327,7 @@ uninstall_all() {
     return 1
   fi
 
-  green "卸载完成，sing-box 服务和二进制已清理。"
+  green "卸载完成，脚本创建的服务、节点、证书、缓存、订阅、伪装站和系统网络加速/优化配置已清理。"
 }
 
 do_one_click_all_with_cdn() {
@@ -5779,7 +5785,7 @@ main_menu() {
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
     echo "  98 更新sing-box 版本"
-    echo "  99 卸载sing-box和节点和伪装站"
+    echo "  99 卸载所有脚本产出内容"
     echo "  0) 退出脚本"
     cyan "================================================="
     read -r -p "请输入对应的数字: " choice
@@ -5841,7 +5847,7 @@ main_menu() {
         ;;
       99)
         echo ""
-        red "警告：此操作将卸载 sing-box、所有节点配置和脚本创建的伪装站！"
+        red "警告：此操作将卸载 sing-box、所有节点配置、证书、缓存、订阅服务、脚本创建的伪装站和系统网络加速/优化配置！"
         read -r -p "确认卸载? (请输入 YES 确认): " confirm
         if [[ "$confirm" != "YES" ]]; then
           yellow "已取消卸载。"
