@@ -2822,16 +2822,17 @@ install_vmess_core() {
 }
 
 build_vmess_share_files() {
-  local label uri public_addr public_port public_host public_tls public_sni
+  local insecure label uri public_addr public_port public_host public_tls public_sni
   ensure_node_info_dir
   label="$NODE_NAME_VMESS"
+  insecure="$(tls_insecure_flag)"
   public_addr="$(vmess_public_addr)"
   public_port="$(vmess_public_port)"
   if vmess_public_tls_enabled; then
     public_host="$(vmess_public_sni)"
     public_tls="tls"
     public_sni="$public_host"
-    uri="vmess://$(echo -n '{"add":"'"$public_addr"'","aid":"0","host":"'"$public_host"'","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$label"'","tls":"'"$public_tls"'","sni":"'"$public_sni"'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)"
+    uri="vmess://$(echo -n '{"add":"'"$public_addr"'","aid":"0","host":"'"$public_host"'","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$label"'","tls":"'"$public_tls"'","sni":"'"$public_sni"'","fp":"chrome","insecure":"'"$insecure"'","allowInsecure":"'"$insecure"'","type":"none","v":"2"}' | base64 -w 0)"
   else
     uri="vmess://$(echo -n '{"add":"'"$public_addr"'","aid":"0","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$label"'","type":"none","v":"2"}' | base64 -w 0)"
   fi
@@ -2859,13 +2860,14 @@ build_vmess_share_files() {
 }
 
 vmess_uri() {
-  local public_addr public_host public_port public_sni
+  local insecure public_addr public_host public_port public_sni
+  insecure="$(tls_insecure_flag)"
   public_addr="$(vmess_public_addr)"
   public_port="$(vmess_public_port)"
   if vmess_public_tls_enabled; then
     public_host="$(vmess_public_sni)"
     public_sni="$public_host"
-    printf 'vmess://%s' "$(echo -n '{"add":"'"$public_addr"'","aid":"0","host":"'"$public_host"'","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$NODE_NAME_VMESS"'","tls":"tls","sni":"'"$public_sni"'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)"
+    printf 'vmess://%s' "$(echo -n '{"add":"'"$public_addr"'","aid":"0","host":"'"$public_host"'","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$NODE_NAME_VMESS"'","tls":"tls","sni":"'"$public_sni"'","fp":"chrome","insecure":"'"$insecure"'","allowInsecure":"'"$insecure"'","type":"none","v":"2"}' | base64 -w 0)"
   else
     printf 'vmess://%s' "$(echo -n '{"add":"'"$public_addr"'","aid":"0","id":"'"$VMESS_UUID"'","net":"ws","path":"'"$VMESS_WS_PATH"'","port":"'"$public_port"'","ps":"'"$NODE_NAME_VMESS"'","type":"none","v":"2"}' | base64 -w 0)"
   fi
@@ -4721,6 +4723,7 @@ build_subscription_clash_yaml() {
         "    ip-version: ipv4-prefer" \
         "    servername: $(yaml_quote "$vmess_sni")" \
         "    client-fingerprint: chrome" \
+        "    skip-cert-verify: $(tls_skip_verify_bool)" \
         "    ws-opts:" \
         "      path: $(yaml_quote "$VMESS_WS_PATH")" \
         "      headers:" \
@@ -4972,6 +4975,7 @@ build_subscription_clash_stable_yaml() {
         "    ip-version: ipv4-prefer" \
         "    servername: $(yaml_quote "$vmess_sni")" \
         "    client-fingerprint: chrome" \
+        "    skip-cert-verify: $(tls_skip_verify_bool)" \
         "    ws-opts:" \
         "      path: $(yaml_quote "$VMESS_WS_PATH")" \
         "      headers:" \
