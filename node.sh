@@ -2644,15 +2644,16 @@ ss2022_uri() {
 }
 
 argo_uri() {
-  local client_server e_host e_label e_path e_sni
+  local client_server e_alpn e_host e_label e_path e_sni
   select_argo_edge_server
   client_server="$(argo_client_server)"
+  e_alpn="$(urlenc "http/1.1")"
   e_sni="$(urlenc "$ARGO_DOMAIN")"
   e_host="$(urlenc "$ARGO_DOMAIN")"
   e_path="$(urlenc "$ARGO_WS_PATH")"
   e_label="$(urlenc "$NODE_NAME_ARGO")"
-  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=%s&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#%s' \
-    "$ARGO_UUID" "$client_server" "$e_sni" "$ARGO_CLIENT_FINGERPRINT" "$e_host" "$e_path" "$e_label"
+  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=%s&alpn=%s&insecure=0&allowInsecure=0&type=ws&host=%s&path=%s#%s' \
+    "$ARGO_UUID" "$client_server" "$e_sni" "$ARGO_CLIENT_FINGERPRINT" "$e_alpn" "$e_host" "$e_path" "$e_label"
 }
 
 calc_cert_pin_sha256() {
@@ -3645,7 +3646,7 @@ write_argo_service() {
     "TimeoutStartSec=90s" \
     "ExecStartPre=/bin/mkdir -p ${STATE_DIR}" \
     "ExecStartPre=/bin/rm -f ${ARGO_BOOT_LOG}" \
-    "ExecStartPre=-/bin/bash ${INSTALL_SCRIPT} --wait-tcp 127.0.0.1 ${ARGO_LOCAL_PORT} 45" \
+    "ExecStartPre=/bin/bash ${INSTALL_SCRIPT} --wait-tcp 127.0.0.1 ${ARGO_LOCAL_PORT} 45" \
     "ExecStart=${exec_start}" \
     "ExecStartPost=-/bin/systemctl --no-block start ${ARGO_REFRESH_SERVICE}" \
     "Restart=on-failure" \
@@ -3906,6 +3907,36 @@ wait_argo_https_reachable() {
 
   for i in $(seq 1 "$attempts"); do
     if validate_argo_https_reachable; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  return 1
+}
+
+validate_argo_ws_reachable() {
+  local status
+
+  [[ -n "${ARGO_DOMAIN:-}" && -n "${ARGO_WS_PATH:-}" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+
+  status="$(curl --http1.1 -sS --connect-timeout 5 --max-time 4 \
+    -o /dev/null -w '%{http_code}' \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    -H 'Sec-WebSocket-Version: 13' \
+    "https://${ARGO_DOMAIN}${ARGO_WS_PATH}" 2>/dev/null || true)"
+
+  [[ "$status" == "101" ]]
+}
+
+wait_argo_ws_reachable() {
+  local attempts="${1:-12}" i
+
+  for i in $(seq 1 "$attempts"); do
+    if validate_argo_ws_reachable; then
       return 0
     fi
     sleep 2
@@ -4180,11 +4211,15 @@ install_argo_core() {
   generate_argo_identity
   ARGO_ENABLED="1"
   write_sing_box_config
+  if ! wait_tcp_endpoint 127.0.0.1 "$ARGO_LOCAL_PORT" 15; then
+    red "Argo 本地入站未监听: 127.0.0.1:${ARGO_LOCAL_PORT}"
+    return 1
+  fi
   write_argo_service
   systemctl daemon-reload
   systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
   enable_argo_refresh_automation
-  timeout 60 systemctl restart "$ARGO_SERVICE" || yellow "Argo 服务启动超时，将稍后重试。"
+  timeout 60 systemctl restart "$ARGO_SERVICE" || { red "Argo 服务启动失败。"; return 1; }
 
   if ! refresh_argo_domain; then
     if argo_is_named_tunnel; then
@@ -4192,6 +4227,12 @@ install_argo_core() {
     else
       yellow "cloudflared 已启动，但暂未抓到 trycloudflare.com 域名；稍后可在节点信息里刷新查看。"
     fi
+    return 1
+  fi
+
+  if ! wait_argo_ws_reachable 12; then
+    red "Argo WebSocket 自检失败：${ARGO_DOMAIN}${ARGO_WS_PATH} 未返回 101。"
+    return 1
   fi
 
   build_argo_share_files "0" || true
@@ -4767,6 +4808,8 @@ build_subscription_clash_yaml() {
         "    ip-version: ipv4-prefer" \
         "    servername: $(yaml_quote "$ARGO_DOMAIN")" \
         "    client-fingerprint: $(yaml_quote "$ARGO_CLIENT_FINGERPRINT")" \
+        "    alpn:" \
+        "      - http/1.1" \
         "    skip-cert-verify: false" \
         "    ws-opts:" \
         "      path: $(yaml_quote "$ARGO_WS_PATH")" \
@@ -5041,6 +5084,8 @@ build_subscription_clash_stable_yaml() {
         "    ip-version: ipv4-prefer" \
         "    servername: $(yaml_quote "$ARGO_DOMAIN")" \
         "    client-fingerprint: $(yaml_quote "$ARGO_CLIENT_FINGERPRINT")" \
+        "    alpn:" \
+        "      - http/1.1" \
         "    skip-cert-verify: false" \
         "    ws-opts:" \
         "      path: $(yaml_quote "$ARGO_WS_PATH")" \
@@ -5636,6 +5681,11 @@ do_one_click_all() {
   systemctl stop argo-refresh.timer argo-refresh.service vless-xhttp-reality-self-argo-refresh.timer vless-xhttp-reality-self-argo-refresh.service vless-xhttp-reality-self-argo.service 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 
+  if ! wait_tcp_endpoint 127.0.0.1 "$ARGO_LOCAL_PORT" 15; then
+    red "Argo 本地入站未监听: 127.0.0.1:${ARGO_LOCAL_PORT}"
+    red "请检查 sing-box 是否正常启动，已停止本次安装以避免输出不可用的 Argo 节点。"
+    return 1
+  fi
   write_argo_service
   systemctl daemon-reload
   systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
@@ -5643,17 +5693,20 @@ do_one_click_all() {
   echo ""
   echo "正在启动 cloudflared 服务..."
   if systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1; then
-    if refresh_argo_domain 8; then
+    if refresh_argo_domain 8 && wait_argo_ws_reachable 12; then
       if argo_is_named_tunnel; then
         green "✓ Cloudflare Argo 固定隧道启动成功！域名: ${ARGO_DOMAIN}"
       else
         green "✓ Cloudflare Argo 临时隧道启动成功！域名: ${ARGO_DOMAIN}"
       fi
     else
-      yellow "! Cloudflare Argo 已启动，暂未获取到域名，稍后可在节点信息中刷新。"
+      red "Argo WebSocket 自检失败：${ARGO_DOMAIN}${ARGO_WS_PATH} 未返回 101。"
+      red "已停止本次安装以避免输出不可用的 Argo 节点。"
+      return 1
     fi
   else
     red "✗ Cloudflare Argo 隧道启动失败，跳过 Argo。"
+    return 1
   fi
 
   echo "正在构建全协议分享文件..."
@@ -5726,14 +5779,8 @@ do_one_click_all() {
     echo ""
   fi
   if [[ "${ARGO_ENABLED:-0}" == "1" && -n "${ARGO_DOMAIN:-}" ]]; then
-    local argo_server e_domain e_path e_label
-    select_argo_edge_server
-    argo_server="$(argo_client_server)"
-    e_domain="$(urlenc "$ARGO_DOMAIN")"
-    e_path="$(urlenc "$ARGO_WS_PATH")"
-    e_label="$(urlenc "$NODE_NAME_ARGO")"
     echo "[Argo-VLESS]"
-    echo "vless://${ARGO_UUID}@${argo_server}:443?encryption=none&security=tls&sni=${e_domain}&fp=chrome&insecure=0&allowInsecure=0&type=ws&host=${e_domain}&path=${e_path}#${e_label}"
+    argo_uri
     echo ""
   fi
   echo "======================================"
@@ -6268,19 +6315,27 @@ do_one_click_all_with_cdn() {
     systemctl daemon-reload 2>/dev/null || true
 
     generate_argo_identity
+    if ! wait_tcp_endpoint 127.0.0.1 "$ARGO_LOCAL_PORT" 15; then
+      red "Argo 本地入站未监听: 127.0.0.1:${ARGO_LOCAL_PORT}"
+      red "请检查 sing-box 是否正常启动，已停止本次安装以避免输出不可用的 Argo 节点。"
+      return 1
+    fi
     write_argo_service
     systemctl daemon-reload
     systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
     enable_argo_refresh_automation
     echo "正在启动 cloudflared..."
     if systemctl restart "$ARGO_SERVICE" >/dev/null 2>&1; then
-      if refresh_argo_domain 8; then
+      if refresh_argo_domain 8 && wait_argo_ws_reachable 12; then
         green "Argo 隧道启动成功！域名: ${ARGO_DOMAIN}"
       else
-        yellow "Argo 已启动，暂未获取到域名。"
+        red "Argo WebSocket 自检失败：${ARGO_DOMAIN}${ARGO_WS_PATH} 未返回 101。"
+        red "已停止本次安装以避免输出不可用的 Argo 节点。"
+        return 1
       fi
     else
       red "Argo 隧道启动失败。"
+      return 1
     fi
   fi
 
