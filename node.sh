@@ -1211,6 +1211,86 @@ cf_upsert_site_dns() {
   green "Cloudflare DNS 已配置: ${site_domain} -> ${vps_ip} (${proxied_label})"
 }
 
+cf_enable_universal_ssl() {
+  local zone_id="$1" data
+  data="$(jq -nc '{enabled:true}')"
+  cf_api_request PATCH "/zones/${zone_id}/ssl/universal/settings" "$data" >/dev/null
+}
+
+cf_ensure_edge_certificate() {
+  local cert_domain="$1" zone_id="$2" zone_name="${3:-}" response parent wildcard pack pack_id pack_type pack_status pack_hosts
+
+  ensure_packages_for_commands curl jq || return 1
+
+  yellow "正在开启 Cloudflare Universal SSL..."
+  cf_enable_universal_ssl "$zone_id" || return 1
+
+  yellow "正在查询 Cloudflare 边缘证书状态..."
+  response="$(cf_api_request GET "/zones/${zone_id}/ssl/certificate_packs?per_page=100")" || return 1
+  parent="${cert_domain#*.}"
+  if [[ "$parent" != "$cert_domain" ]]; then
+    wildcard="*.${parent}"
+  else
+    wildcard=""
+  fi
+  pack="$(printf '%s' "$response" | jq -r \
+    --arg host "$cert_domain" \
+    --arg wildcard "$wildcard" \
+    '.result[]? | select(((.hosts // []) | index($host)) or ($wildcard != "" and ((.hosts // []) | index($wildcard)))) | [.id, .type, .status, ((.hosts // []) | join(","))] | @tsv' \
+    2>/dev/null | head -1)"
+
+  if [[ -n "$pack" ]]; then
+    IFS=$'\t' read -r pack_id pack_type pack_status pack_hosts <<< "$pack"
+    green "Cloudflare 边缘证书已存在/已申请: ${pack_status:-unknown}"
+    echo "证书包: ${pack_id:-unknown} (${pack_type:-unknown})"
+    echo "覆盖域名: ${pack_hosts:-unknown}"
+  else
+    yellow "未立即查询到覆盖 ${cert_domain} 的证书包。"
+    yellow "Universal SSL 已开启，Cloudflare 会为橙云域名异步签发边缘证书；请稍后在 Cloudflare SSL/TLS > Edge Certificates 查看状态。"
+  fi
+}
+
+configure_cf_orange_edge_certificate() {
+  local edge_domain api_token vps_ip
+
+  load_state >/dev/null 2>&1 || true
+  load_node_config >/dev/null 2>&1 || true
+  clear_unconfigured_node_config_values
+
+  cyan "================ Cloudflare 橙云 DNS + 边缘证书 ================"
+  read -r -p "请输入要开启橙云的域名: " edge_domain
+  edge_domain="$(normalize_argo_host "${edge_domain:-}")"
+  [[ -n "$edge_domain" ]] || { red "域名不能为空。"; return 1; }
+
+  read -r -p "Cloudflare API Token: " api_token
+  api_token="$(printf '%s' "${api_token:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [[ -n "$api_token" ]] || { red "Cloudflare API Token 不能为空。"; return 1; }
+  CF_API_TOKEN="$api_token"
+
+  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  if [[ -z "$vps_ip" ]]; then
+    read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
+    [[ -n "$vps_ip" ]] || { red "VPS IP 不能为空。"; return 1; }
+  fi
+
+  DOMAIN="$edge_domain"
+  SITE_DOMAIN="$edge_domain"
+
+  yellow "正在查找 Cloudflare Zone..."
+  cf_find_zone_for_host "$edge_domain" || return 1
+  yellow "正在创建/更新橙云 DNS A 记录: ${edge_domain} -> ${vps_ip}"
+  cf_upsert_site_dns "$edge_domain" "$vps_ip" true || return 1
+  cf_ensure_edge_certificate "$edge_domain" "$ARGO_CF_ZONE_ID" "$ARGO_CF_ZONE_NAME" || return 1
+
+  save_state
+  save_node_config
+
+  green "Cloudflare 橙云 DNS + 边缘证书配置完成。"
+  echo "域名: ${edge_domain}"
+  echo "Zone: ${ARGO_CF_ZONE_NAME:-unknown}"
+  echo "A 记录: ${edge_domain} -> ${vps_ip} (橙云)"
+}
+
 issue_cf_origin_certificate() {
   local cert_domain="$1" csr_file response cert
   install_required_command curl || return 1
@@ -1247,119 +1327,6 @@ issue_cf_origin_certificate() {
   REALITY_SNI="${REALITY_SNI:-$cert_domain}"
   SELF_SIGN_CERT="0"
   USE_CF_ORIGIN_CA_CERT="1"
-}
-
-prepare_cf_proxy_mask_site() {
-  local choice site_domain vps_ip has_site existing_site
-  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
-  if [[ -z "$vps_ip" ]]; then
-    read -r -p "Input local public IP: " vps_ip
-    [[ -n "$vps_ip" ]] || { red "public IP is required"; return 1; }
-  fi
-
-  existing_site="${SITE_DOMAIN:-}"
-  if [[ -z "$existing_site" && -n "${DOMAIN:-}" && "${DOMAIN}" != "www.apple.com" ]]; then
-    existing_site="$DOMAIN"
-  fi
-  if [[ -z "$existing_site" ]]; then
-    existing_site="$(detect_cert_primary_name 2>/dev/null || true)"
-  fi
-
-  has_site="0"
-  if [[ -n "$existing_site" ]]; then
-    has_site="1"
-  fi
-
-  echo ""
-  cyan "--- Mask site / SNI ---"
-  if [[ "$has_site" == "1" ]]; then
-    echo "Found previous mask site domain: ${existing_site}"
-    read -r -p "Continue using this mask site domain? [Y/n]: " choice
-    if [[ ! "$choice" =~ ^[Nn]$ ]]; then
-      SITE_DOMAIN="$existing_site"
-      DOMAIN="$existing_site"
-      SNI_VAL="$existing_site"
-      REALITY_SNI="${REALITY_SNI:-$existing_site}"
-      SELF_SIGN_CERT="1"
-      yellow "Ensuring CF DNS A record (proxied): ${SITE_DOMAIN} -> ${vps_ip}"
-      cf_upsert_site_dns "$SITE_DOMAIN" "$vps_ip" true || return 1
-      if ! cert_files_exist || ! cert_matches_domain; then
-        issue_cf_origin_certificate "$SITE_DOMAIN" || return 1
-      else
-        USE_CF_ORIGIN_CA_CERT="1"
-      fi
-      SITE_ENABLED="1"
-      SITE_BRAND="${SITE_BRAND:-EduPanel}"
-      install_mask_site_nginx || return 1
-      save_state
-      return 0
-    fi
-    has_site="0"
-    echo "1) Create new site"
-    echo "2) Use www.apple.com as fake SNI"
-    read -r -p "Choose [default 1]: " choice
-    choice="${choice:-1}"
-    [[ "$choice" == "2" ]] && choice="3"
-  else
-    echo "No existing mask site found."
-    echo "1) Create new site"
-    echo "2) Use www.apple.com as fake SNI"
-    read -r -p "Choose [default 1]: " choice
-    choice="${choice:-1}"
-    [[ "$choice" == "2" ]] && choice="3"
-  fi
-
-  case "$choice" in
-    1)
-      if [[ "$has_site" == "1" ]]; then
-        DOMAIN="$SITE_DOMAIN"
-        SNI_VAL="$SITE_DOMAIN"
-        REALITY_SNI="${REALITY_SNI:-$SITE_DOMAIN}"
-        SELF_SIGN_CERT="0"
-        return 0
-      fi
-      ;&
-    2)
-      read -r -p "Input mask site domain: " site_domain
-      site_domain="$(normalize_argo_host "$site_domain")"
-      [[ -n "$site_domain" ]] || { red "site domain is required"; return 1; }
-      yellow "Upserting CF DNS A record (proxied): ${site_domain} -> ${vps_ip}"
-      cf_upsert_site_dns "$site_domain" "$vps_ip" true || return 1
-      issue_cf_origin_certificate "$site_domain" || return 1
-      SITE_ENABLED="1"
-      SITE_DOMAIN="$site_domain"
-      SITE_BRAND="${SITE_BRAND:-EduPanel}"
-      install_mask_site_nginx || return 1
-      save_state
-      ;;
-    3)
-      DOMAIN=""
-      SNI_VAL="www.apple.com"
-      REALITY_SNI="www.apple.com"
-      SELF_SIGN_CERT="1"
-      ;;
-    *)
-      red "invalid choice"
-      return 1
-      ;;
-  esac
-}
-
-create_cf_proxy_node() {
-  clear
-  load_state >/dev/null 2>&1 || true
-  load_node_config >/dev/null 2>&1 || true
-  clear_unconfigured_node_config_values
-  cyan "================ Create CF Proxy Node ================"
-
-  prompt_common_uuid || return 1
-  prompt_cf_api_token || return 1
-  CF_PROXY_REUSE_READY="1"
-  save_node_config
-  save_state
-
-  prepare_cf_proxy_mask_site || return 1
-  do_one_click_all_with_cdn
 }
 
 prompt_cf_api_token() {
@@ -6322,72 +6289,6 @@ do_one_click_all_basic_without_cf() {
   do_one_click_all_with_cdn 0 no_cf
 }
 
-do_one_click_all_with_cf_cdn() {
-  do_one_click_all_with_cdn 1
-}
-
-create_node_submenu() {
-  while true; do
-    clear
-    cyan "================================================="
-    cyan "             创建代理节点"
-    cyan "================================================="
-    echo "  1) 一键生成所有标准协议 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo)"
-    echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
-    echo "  3) 一键全协议+CDN 黄云版 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo/CDN)"
-    echo "  4) 全协议cf灰云+橙云+argo+cdn"
-    echo "  5) Create CF proxy node"
-    echo "  0) 返回主菜单"
-    cyan "================================================="
-    read -r -p "请输入对应的数字: " sub_choice
-
-    case "$sub_choice" in
-      1)
-        if ! do_one_click_all; then
-          red "创建代理节点失败。"
-          echo "按回车键返回..."
-          read -r
-        fi
-        ;;
-      2)
-        if ! install_cdn_vmess_core; then
-          red "CDN+VMess+WS 节点安装失败。"
-        fi
-        echo "按回车键返回..."
-        read -r
-        ;;
-      3)
-        if ! do_one_click_all_with_cf_cdn; then
-          red "一键全协议+CDN 黄云版安装失败。"
-          echo "按回车键返回..."
-          read -r
-        fi
-        ;;
-      4)
-        if ! do_one_click_all_with_direct_cdn; then
-          red "全协议cf灰云+橙云+argo+cdn 安装失败。"
-          echo "按回车键返回..."
-          read -r
-        fi
-        ;;
-      5)
-        if ! create_cf_proxy_node; then
-          red "Create CF proxy node failed."
-          echo "Press Enter to return..."
-          read -r
-        fi
-        ;;
-      0)
-        return 0
-        ;;
-      *)
-        red "无效输入。"
-        sleep 1
-        ;;
-    esac
-  done
-}
-
 main_menu() {
   while true; do
     load_state >/dev/null 2>&1 || true
@@ -6402,9 +6303,8 @@ main_menu() {
     echo ""
     echo "  1  安装 sing-box"
     echo "  2) 基础协议(无cf版)"
-    echo "  3) 创建代理节点"
     echo "  4) 全协议cf灰云+橙云+argo+cdn"
-    echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
+    echo "  5) Cloudflare 橙云 DNS + 边缘证书"
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
     echo "  8) 节点订阅链接"
@@ -6434,9 +6334,6 @@ main_menu() {
         echo "按回车键返回主菜单..."
         read -r
         ;;
-      3)
-        create_node_submenu
-        ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
           red "全协议cf灰云+橙云+argo+cdn 安装失败。"
@@ -6445,8 +6342,8 @@ main_menu() {
         fi
         ;;
       5)
-        if ! do_one_click_all_with_cf_cdn; then
-          red "一键全协议+CDN 黄云代理版安装失败。"
+        if ! configure_cf_orange_edge_certificate; then
+          red "Cloudflare 橙云 DNS + 边缘证书配置失败。"
           echo "按回车键返回主菜单..."
           read -r
         fi
