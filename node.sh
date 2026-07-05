@@ -32,8 +32,10 @@ ARGO_BOOT_LOG="/var/log/cloudflared.log"
 SUBSCRIPTION_DIR="/var/www/subscription"
 CONFIG_DIR="/etc/agsb"
 NODE_CONFIG_FILE="${NODE_CONFIG_FILE:-${CONFIG_DIR}/node.config}"
+SUB_NGINX_AUTH_FILE="${SUB_NGINX_AUTH_FILE:-/etc/nginx/.agsb-subscription.htpasswd}"
 INSTALL_SCRIPT="$(realpath "$0")"
 MASK_SITE_SCRIPT_URL="${MASK_SITE_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/mask-site.sh}"
+SUBSCRIPTION_LINK_SCRIPT_URL="${SUBSCRIPTION_LINK_SCRIPT_URL:-https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/subscription-link.sh}"
 
 # 颜色输出
 red() { printf '\e[31m%s\e[0m\n' "$*"; }
@@ -700,6 +702,41 @@ run_remote_mask_site_script() {
   else
     bash "$tmp_script" "$action"
   fi
+  rc=$?
+  rm -f "$tmp_script"
+  return "$rc"
+}
+
+subscription_link_script_fetch_url() {
+  local sep="?"
+  [[ "$SUBSCRIPTION_LINK_SCRIPT_URL" == *\?* ]] && sep="&"
+  printf '%s%s_t=%s\n' "$SUBSCRIPTION_LINK_SCRIPT_URL" "$sep" "${RANDOM}${RANDOM}"
+}
+
+run_subscription_link_script() {
+  local action="$1" tmp_script url rc local_script script_dir
+
+  script_dir="$(cd "$(dirname "$INSTALL_SCRIPT")" 2>/dev/null && pwd -P || true)"
+  local_script="${script_dir}/subscription-link.sh"
+  if [[ -n "$script_dir" && -f "$local_script" ]]; then
+    STATE_DIR="$STATE_DIR" NODE_CONFIG_FILE="$NODE_CONFIG_FILE" \
+      MASK_SITE_SCRIPT_URL="$MASK_SITE_SCRIPT_URL" SUB_NGINX_AUTH_FILE="$SUB_NGINX_AUTH_FILE" \
+      bash "$local_script" "$action"
+    return $?
+  fi
+
+  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法拉取远程订阅链接脚本。"; return 1; }
+  url="$(subscription_link_script_fetch_url)"
+  yellow "正在从远程加载订阅链接脚本：${SUBSCRIPTION_LINK_SCRIPT_URL}"
+  tmp_script="$(mktemp /tmp/subscription-link.XXXXXX.sh)" || return 1
+  if ! curl -fsSL -H "Cache-Control: no-cache" "$url" -o "$tmp_script"; then
+    rm -f "$tmp_script"
+    red "远程订阅链接脚本下载失败：${SUBSCRIPTION_LINK_SCRIPT_URL}"
+    return 1
+  fi
+  STATE_DIR="$STATE_DIR" NODE_CONFIG_FILE="$NODE_CONFIG_FILE" \
+    MASK_SITE_SCRIPT_URL="$MASK_SITE_SCRIPT_URL" SUB_NGINX_AUTH_FILE="$SUB_NGINX_AUTH_FILE" \
+    bash "$tmp_script" "$action"
   rc=$?
   rm -f "$tmp_script"
   return "$rc"
@@ -1465,9 +1502,41 @@ clear_node_config_file() {
 
 show_node_config_path() {
   if [[ -f "$NODE_CONFIG_FILE" ]]; then
-    echo "   配置文件: ${NODE_CONFIG_FILE} (存在)"
+    echo "   配置文件: ${NODE_CONFIG_FILE}"
   else
-    echo "   配置文件: ${NODE_CONFIG_FILE} (未创建)"
+    echo "   配置文件: 无"
+  fi
+}
+
+print_sing_box_panel_status() {
+  local sb_status sb_ver sb_latest
+
+  if [[ -x "$SING_BOX_BIN" ]]; then
+    if systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
+      sb_status="运行中"
+    elif [[ ! -s "$SING_BOX_CFG" ]]; then
+      sb_status="已安装/未配置"
+    else
+      sb_status="未运行"
+    fi
+    sb_ver="$("$SING_BOX_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    sb_ver="${sb_ver:-未知}"
+  elif systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
+    sb_status="服务残留运行"
+    sb_ver="-"
+  else
+    sb_status="未安装"
+    sb_ver="-"
+  fi
+
+  detect_sing_box_version
+  sb_latest="$SING_BOX_VERSION"
+  if [[ "$sb_ver" != "-" && "$sb_ver" != "未知" && "$sb_ver" == "$sb_latest" ]]; then
+    green "   sing-box: ${sb_ver}(${sb_status}/最新版)"
+  elif [[ "$sb_ver" != "-" && "$sb_ver" != "未知" && -n "$sb_latest" ]]; then
+    red "   sing-box: ${sb_ver}(${sb_status}/可升级，最新版: ${sb_latest})"
+  else
+    yellow "   sing-box: ${sb_ver}(${sb_status}/最新版: ${sb_latest})"
   fi
 }
 
@@ -1719,7 +1788,7 @@ save_state() {
              VMESS_PORT VMESS_UUID VMESS_WS_PATH VMESS_SERVER_ADDR VMESS_TLS_ENABLED VMESS_TLS_SNI \
              TUIC_PORT TUIC_PASSWORD TUIC_UUID TUIC_TLS_SNI TUIC_SERVER_ADDR \
              ARGO_LOCAL_PORT ARGO_DOMAIN ARGO_UUID ARGO_WS_PATH ARGO_EDGE_SERVER ARGO_EDGE_POOL_FILE ARGO_PROTOCOL ARGO_EDGE_IP_VERSION ARGO_FIXED_DOMAIN ARGO_TUNNEL_TOKEN ARGO_TUNNEL_ID ARGO_CF_ACCOUNT_ID ARGO_CF_ZONE_ID ARGO_CF_ZONE_NAME ARGO_MULTI_EDGE \
-             SUB_PORT SUB_PATH SUB_ENABLED SUB_CF_PROXY \
+             SUB_PORT SUB_PATH SUB_ENABLED SUB_CF_PROXY SUB_NGINX_ENABLED SUB_NGINX_PATH SUB_NGINX_AUTH_FILE \
              SITE_ENABLED SITE_DOMAIN SITE_BRAND SITE_ROOT NGINX_SITE_CONF VMESS_VIA_NGINX \
              DOMAIN SNI_VAL SELF_SIGN_CERT CF_API_TOKEN \
              NODE_NAME_VLESS NODE_NAME_HY2 NODE_NAME_SS2022 NODE_NAME_VMESS NODE_NAME_TUIC NODE_NAME_ARGO NODE_NAME_ANYTLS \
@@ -1910,6 +1979,7 @@ NODE_NAME_ARGO="${NODE_NAME_ARGO:-Argo-VLESS}"
 NODE_NAME_CDN_VMESS="${NODE_NAME_CDN_VMESS:-CDN-VMess}"
 CDN_VMESS_CF_PROXY="${CDN_VMESS_CF_PROXY:-1}"
 SUB_CF_PROXY="${SUB_CF_PROXY:-0}"
+SUB_NGINX_ENABLED="${SUB_NGINX_ENABLED:-0}"
 
 # 密码/密钥生成函数
 generate_hy2_password() {
@@ -5350,9 +5420,9 @@ do_one_click_all() {
 
   # 2. 引导获取必要协议的端口
   echo ""
-  echo "本次安装将包含以下 6 个需要对外暴露端口的标准协议："
-  echo "1. Hysteria2  2. Shadowsocks-2022  3. VMess  4. TUIC v5  5. AnyTLS  6. VLESS"
-  read -r -p "请依次输入这 6 个协议的端口，用逗号隔开 (例如: 50001,50002,50003,50004,50005,50006，留空则全部自动随机分配 50000-60000): " custom_ports
+  echo "本次安装将包含以下 5 个需要对外暴露端口的标准协议："
+  echo "1. Hysteria2  2. VMess  3. TUIC v5  4. AnyTLS  5. VLESS"
+  read -r -p "请依次输入这 5 个协议的端口，用逗号隔开 (例如: 50001,50002,50003,50004,50005，留空则全部自动随机分配 50000-60000): " custom_ports
   
   if [[ -z "$custom_ports" ]]; then
     local _used_ports=() _p
@@ -5371,15 +5441,14 @@ do_one_click_all() {
         TUIC) TUIC_PORT="$_p" ;;
       esac
     done
-    echo "已自动生成端口: HY2=$HY2_PORT, SS=$SS2022_PORT, VMess=$VMESS_PORT, TUIC=$TUIC_PORT, AnyTLS=$ANYTLS_PORT, VLESS=$VLESS_PORT"
+    echo "已自动生成端口: HY2=$HY2_PORT, VMess=$VMESS_PORT, TUIC=$TUIC_PORT, AnyTLS=$ANYTLS_PORT, VLESS=$VLESS_PORT"
   else
     IFS=',' read -r -a port_array <<< "$custom_ports"
     HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    SS2022_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VMESS_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    TUIC_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    ANYTLS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VLESS_PORT="${port_array[5]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
   fi
 
   local _used_ports=() _port_var _port_val _new_port
@@ -5808,15 +5877,15 @@ do_one_click_all_with_cdn() {
     cf_find_zone_for_host "$DOMAIN" >/dev/null 2>&1 || true
   fi
 
-  # ===== 第4步: 端口分配（7个协议: HY2/SS/VMess/TUIC/AnyTLS/VLESS + CDN-VMess） =====
+  # ===== 第4步: 端口分配（5个直连协议: HY2/VMess/TUIC/AnyTLS/VLESS；CDN-VMess 后续单独配置） =====
   echo ""
-  echo "本次安装将包含以下 7 个需要端口的协议:"
-  echo "1.Hysteria2 2.SS-2022 3.VMess 4.TUIC 5.AnyTLS 6.VLESS 7.CDN-VMess"
-  read -r -p "请依次输入 7 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
+  echo "本次安装将包含以下 5 个需要端口的协议:"
+  echo "1.Hysteria2 2.VMess 3.TUIC 4.AnyTLS 5.VLESS"
+  read -r -p "请依次输入 5 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
 
   if [[ -z "$custom_ports" ]]; then
     local _used_ports=() _p
-    for _proto in HY2 SS2022 VMESS TUIC ANYTLS VLESS CDN_VMESS; do
+    for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
         [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
@@ -5824,29 +5893,25 @@ do_one_click_all_with_cdn() {
       _used_ports+=("$_p")
       case "$_proto" in
         HY2) HY2_PORT="$_p" ;;
-        SS2022) SS2022_PORT="$_p" ;;
         VMESS) VMESS_PORT="$_p" ;;
         TUIC) TUIC_PORT="$_p" ;;
         ANYTLS) ANYTLS_PORT="$_p" ;;
         VLESS) VLESS_PORT="$_p" ;;
-        CDN_VMESS) CDN_VMESS_PORT="$_p" ;;
       esac
     done
-    echo "已自动生成端口: HY2=$HY2_PORT SS=$SS2022_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT CDN-VMess=$CDN_VMESS_PORT"
+    echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
   else
     IFS=',' read -r -a port_array <<< "$custom_ports"
     HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    SS2022_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VMESS_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    TUIC_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    ANYTLS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VLESS_PORT="${port_array[5]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    CDN_VMESS_PORT="${port_array[6]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
   fi
 
   # 端口去重和冲突检测
   local _used_ports=() _port_var _port_val _new_port
-  for _port_var in HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT; do
+  for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT; do
     _port_val="${!_port_var:-}"
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
@@ -6129,8 +6194,8 @@ create_node_submenu() {
     cyan "================================================="
     echo "  1) 一键生成所有标准协议 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo)"
     echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
-    echo "  3) 一键全协议+CDN 黄云版 (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo/CDN)"
-    echo "  4) 一键全协议+CDN 橙云回源443版 (便于替换 CF 优选 IP/域名)"
+    echo "  3) 一键全协议+CDN 黄云版 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo/CDN)"
+    echo "  4) 全协议cf灰云+橙云+argo+cdn"
     echo "  5) Create CF proxy node"
     echo "  0) 返回主菜单"
     cyan "================================================="
@@ -6160,7 +6225,7 @@ create_node_submenu() {
         ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
-          red "一键全协议+CDN 橙云回源443版安装失败。"
+          red "全协议cf灰云+橙云+argo+cdn 安装失败。"
           echo "按回车键返回..."
           read -r
         fi
@@ -6192,36 +6257,18 @@ main_menu() {
     cyan "             节点配置与订阅管理面板"
     cyan "================================================="
 
-    local sb_status sb_ver sb_latest
-    if [[ -x "$SING_BOX_BIN" ]]; then
-      if systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
-        sb_status="运行中"
-      elif [[ ! -s "$SING_BOX_CFG" ]]; then
-        sb_status="已安装/未配置"
-      else
-        sb_status="未运行"
-      fi
-      sb_ver="$("$SING_BOX_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-      sb_ver="${sb_ver:-未知}"
-    elif systemctl is-active --quiet "$SING_BOX_SERVICE" 2>/dev/null; then
-      sb_status="服务残留运行"
-      sb_ver="-"
-    else
-      sb_status="未安装"
-      sb_ver="-"
-    fi
-    detect_sing_box_version
-    sb_latest="$SING_BOX_VERSION"
-    echo "   sing-box: ${sb_ver}(${sb_status})    官网最新版本: ${sb_latest}"
     show_node_config_path
+    print_sing_box_panel_status
+    echo ""
     echo "  1  安装 sing-box"
-    echo "  2  装站点且 nginx 代理"
     echo "  3) 创建代理节点"
-    echo "  4) 一键全协议+CDN 橙云回源443版 (便于替换 CF 优选 IP/域名)"
+    echo "  4) 全协议cf灰云+橙云+argo+cdn"
     echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
+    echo "  8) 节点订阅链接"
     echo "  90 配置文件管理"
+    echo "  97 装站点且 nginx 代理"
     echo "  98 更新sing-box 版本"
     echo "  99 卸载所有脚本产出内容"
     echo "  0) 退出脚本"
@@ -6251,7 +6298,7 @@ main_menu() {
         ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
-          red "一键全协议+CDN 橙云回源443版安装失败。"
+          red "全协议cf灰云+橙云+argo+cdn 安装失败。"
           echo "按回车键返回主菜单..."
           read -r
         fi
@@ -6271,8 +6318,22 @@ main_menu() {
         echo "按回车键返回主菜单..."
         read -r
         ;;
+      8)
+        if ! run_subscription_link_script configure; then
+          red "节点订阅链接配置失败。"
+        fi
+        echo "按回车键返回主菜单..."
+        read -r
+        ;;
       90)
         manage_node_config_menu
+        ;;
+      97)
+        if ! install_mask_site_nginx; then
+          red "站点和 nginx 代理配置失败。"
+        fi
+        echo "按回车键返回主菜单..."
+        read -r
         ;;
       98)
         yellow "正在更新 sing-box 版本..."

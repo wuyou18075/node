@@ -33,7 +33,7 @@ load_state() {
     [[ -z "$k" || "$k" == "#"* ]] && continue
     [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case "$k" in
-      SITE_DOMAIN|SITE_TEMPLATE|SITE_ROOT|NGINX_SITE_CONF|DOMAIN|SNI_VAL|SELF_SIGN_CERT|VMESS_VIA_NGINX|VMESS_WS_PATH|VMESS_PORT|CDN_VMESS_VIA_NGINX|CDN_VMESS_CDN_DOMAIN|CDN_VMESS_WS_PATH|CDN_VMESS_PORT)
+      SITE_DOMAIN|SITE_TEMPLATE|SITE_ROOT|NGINX_SITE_CONF|DOMAIN|SNI_VAL|SELF_SIGN_CERT|VMESS_VIA_NGINX|VMESS_WS_PATH|VMESS_PORT|CDN_VMESS_VIA_NGINX|CDN_VMESS_CDN_DOMAIN|CDN_VMESS_WS_PATH|CDN_VMESS_PORT|SUB_NGINX_ENABLED|SUB_NGINX_PATH|SUB_NGINX_AUTH_FILE|SUB_PORT|SUB_PATH)
         declare -g "${k}=${v}"
         ;;
     esac
@@ -377,7 +377,7 @@ nginx_server_names() {
 }
 
 write_https_nginx_config() {
-  local vmess_block="" cdn_vmess_block="" server_names
+  local vmess_block="" cdn_vmess_block="" subscription_block="" subscription_limit_zone="" server_names sub_proxy_scheme
   server_names="$(nginx_server_names)"
   if [[ "${VMESS_VIA_NGINX:-0}" == "1" && -n "${VMESS_WS_PATH:-}" && -n "${VMESS_PORT:-}" ]]; then
     vmess_block="
@@ -405,10 +405,33 @@ write_https_nginx_config() {
     }
 "
   fi
+  if [[ "${SUB_NGINX_ENABLED:-0}" == "1" && -n "${SUB_NGINX_PATH:-}" && -n "${SUB_NGINX_AUTH_FILE:-}" && -n "${SUB_PORT:-}" && -n "${SUB_PATH:-}" ]]; then
+    sub_proxy_scheme="https"
+    [[ "${SELF_SIGN_CERT:-0}" == "1" ]] && sub_proxy_scheme="http"
+    subscription_limit_zone="limit_req_zone \$binary_remote_addr zone=agsb_sub_auth:10m rate=5r/m;"
+    subscription_block="
+    location ^~ ${SUB_NGINX_PATH} {
+        auth_basic \"Subscription\";
+        auth_basic_user_file ${SUB_NGINX_AUTH_FILE};
+        limit_req zone=agsb_sub_auth burst=5 nodelay;
+        limit_req_status 429;
+        rewrite ^${SUB_NGINX_PATH}/?(.*)$ /${SUB_PATH}/\$1 break;
+        proxy_pass ${sub_proxy_scheme}://127.0.0.1:${SUB_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60s;
+        proxy_ssl_verify off;
+    }
+"
+  fi
 
   mkdir -p "$(dirname "$NGINX_SITE_CONF")"
   cat > "$NGINX_SITE_CONF" <<NGINX
 # Managed by AGSB mask-site.sh. Existing nginx sites are not modified.
+${subscription_limit_zone}
 server {
     listen 80;
     listen [::]:80;
@@ -445,6 +468,7 @@ server {
     location = /status { try_files /status.html =404; }
 ${vmess_block}
 ${cdn_vmess_block}
+${subscription_block}
     location / { try_files \$uri \$uri/ /index.html; }
 }
 NGINX
