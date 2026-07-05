@@ -1597,7 +1597,7 @@ generate_self_signed_domain_cert() {
 }
 
 configure_domain_certificate_with_config() {
-  local input_domain use_existing vps_ip
+  local attempt input_domain use_existing vps_ip
 
   if confirm_reuse_config_value DOMAIN "主域名"; then
     input_domain="$DOMAIN"
@@ -1621,10 +1621,19 @@ configure_domain_certificate_with_config() {
   REALITY_SNI="${REALITY_SNI:-$DOMAIN}"
   SITE_DOMAIN="$DOMAIN"
 
-  if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
-    SELF_SIGN_CERT="0"
-    echo "检测到服务器已存在匹配 ${DOMAIN} 的可用证书，将直接使用。"
-    return 0
+  if cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
+    if cert_is_publicly_trusted "$DOMAIN"; then
+      SELF_SIGN_CERT="0"
+      USE_CF_ORIGIN_CA_CERT="0"
+      echo "检测到服务器已存在匹配 ${DOMAIN} 的公开可信证书，将直接使用。"
+      return 0
+    fi
+    if cert_is_cf_origin_ca; then
+      SELF_SIGN_CERT="1"
+      USE_CF_ORIGIN_CA_CERT="1"
+      echo "检测到服务器已存在匹配 ${DOMAIN} 的 Cloudflare Origin CA 证书，将直接使用，分享链接会启用 insecure=1。"
+      return 0
+    fi
   fi
 
   yellow "未检测到匹配 ${DOMAIN} 的可用证书，将尝试自动配置 Cloudflare DNS 并申请证书。"
@@ -1645,10 +1654,27 @@ configure_domain_certificate_with_config() {
   SITE_ENABLED="1"
   USE_CF_ORIGIN_CA_CERT="0"
   save_state
-  install_mask_site_nginx || return 1
+  for attempt in 1 2 3; do
+    if install_mask_site_nginx && cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
+      break
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+      yellow "证书暂未生效，1 秒后重试 (${attempt}/3)..."
+      sleep 1
+    else
+      red "连续 3 次未检测到 ${DOMAIN} 的可用证书。"
+      return 1
+    fi
+  done
   if cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
-    SELF_SIGN_CERT="0"
-    echo "证书已申请并同步到 ${SSL_DIR}。"
+    if cert_is_publicly_trusted "$DOMAIN"; then
+      SELF_SIGN_CERT="0"
+      USE_CF_ORIGIN_CA_CERT="0"
+      echo "证书已申请并同步到 ${SSL_DIR}。"
+    else
+      SELF_SIGN_CERT="1"
+      echo "已配置 ${DOMAIN} 的非公开 CA 源站证书，分享链接将启用 insecure=1。"
+    fi
   else
     red "证书申请后仍未检测到 ${DOMAIN} 的可用证书。"
     return 1
