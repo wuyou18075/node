@@ -12,6 +12,8 @@ SITE_ROOT="${SITE_ROOT:-/var/www/edupanel}"
 NGINX_SITE_CONF="${NGINX_SITE_CONF:-/etc/nginx/conf.d/agsb-edupanel.conf}"
 SITE_DOMAIN="${SITE_DOMAIN:-}"
 SITE_TEMPLATE="${SITE_TEMPLATE:-edupanel}"
+CF_API_TOKEN="${CF_API_TOKEN:-}"
+SITE_VPS_IP="${SITE_VPS_IP:-}"
 
 red() { printf '\e[31m%s\e[0m\n' "$*"; }
 green() { printf '\e[32m%s\e[0m\n' "$*"; }
@@ -65,17 +67,184 @@ save_site_state() {
 
 install_packages() {
   local pkgs=("$@")
+  [[ "${#pkgs[@]}" -gt 0 ]] || return 0
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y "${pkgs[@]}" >/dev/null 2>&1
+    dnf install -y "${pkgs[@]}" >/dev/null 2>&1 || {
+      if package_list_contains jq "${pkgs[@]}"; then
+        dnf install -y epel-release >/dev/null 2>&1 || true
+        dnf install -y "${pkgs[@]}" >/dev/null 2>&1
+      else
+        return 1
+      fi
+    }
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y "${pkgs[@]}" >/dev/null 2>&1
+    yum install -y "${pkgs[@]}" >/dev/null 2>&1 || {
+      if package_list_contains jq "${pkgs[@]}"; then
+        yum install -y epel-release >/dev/null 2>&1 || true
+        yum install -y "${pkgs[@]}" >/dev/null 2>&1
+      else
+        return 1
+      fi
+    }
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "${pkgs[@]}" >/dev/null 2>&1
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install -y "${pkgs[@]}" >/dev/null 2>&1
   else
-    red "未找到 apt/dnf/yum，无法自动安装依赖。"
+    red "未找到支持的包管理器，无法自动安装依赖: ${pkgs[*]}"
     return 1
   fi
+}
+
+package_list_contains() {
+  local needle="$1" pkg
+  shift || true
+  for pkg in "$@"; do
+    [[ "$pkg" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+install_required_command() {
+  local cmd="$1" pkg="${2:-$1}"
+  command -v "$cmd" >/dev/null 2>&1 && return 0
+  yellow "缺少 ${cmd}，正在自动安装..."
+  install_packages "$pkg" || {
+    red "依赖安装失败，请手动安装: ${pkg}"
+    return 1
+  }
+  command -v "$cmd" >/dev/null 2>&1 || {
+    red "依赖 ${cmd} 仍不可用，请手动安装后重试。"
+    return 1
+  }
+}
+
+detect_public_ipv4() {
+  local url ip
+  install_required_command curl || return 1
+  for url in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+    ip="$(curl -fsS4 --connect-timeout 3 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || true
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cf_api_request() {
+  local method="$1" path="$2" data="${3:-}" response body http_code errors
+  [[ -n "${CF_API_TOKEN:-}" ]] || { red "Cloudflare API Token 为空。"; return 1; }
+  install_required_command curl || return 1
+  install_required_command jq || return 1
+
+  if [[ -n "$data" ]]; then
+    response="$(curl -sS -w '\n%{http_code}' -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "$data")" || { red "Cloudflare API 网络请求失败。"; return 1; }
+  else
+    response="$(curl -sS -w '\n%{http_code}' -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json")" || { red "Cloudflare API 网络请求失败。"; return 1; }
+  fi
+
+  http_code="$(printf '%s' "$response" | tail -n 1)"
+  body="$(printf '%s' "$response" | sed '$d')"
+  if [[ "$http_code" =~ ^2 ]] && printf '%s' "$body" | jq -e '.success == true' >/dev/null 2>&1; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+
+  errors="$(printf '%s' "$body" | jq -r '[.errors[]? | "\(.code // "no-code"): \(.message // "unknown")"] | join("; ")' 2>/dev/null)"
+  red "Cloudflare API 请求失败: HTTP ${http_code} ${errors:-unknown error}"
+  return 1
+}
+
+cf_find_zone_for_host() {
+  local host="$1" candidate response zone_id
+  candidate="$host"
+  while [[ "$candidate" == *.* ]]; do
+    response="$(cf_api_request GET "/zones?name=${candidate}&status=active&per_page=1")" || return 1
+    zone_id="$(printf '%s' "$response" | jq -r '.result[0].id // empty')"
+    if [[ -n "$zone_id" ]]; then
+      CF_ZONE_ID="$zone_id"
+      CF_ZONE_NAME="$(printf '%s' "$response" | jq -r '.result[0].name // empty')"
+      return 0
+    fi
+    candidate="${candidate#*.}"
+  done
+  red "未能在 Cloudflare 中找到 ${host} 对应的 Zone。"
+  return 1
+}
+
+cf_upsert_site_dns() {
+  local site_domain="$1" vps_ip="$2" proxied="${3:-false}"
+  local response record_id record_ip record_proxied extra_a_ids conflict_ids cid data proxied_json proxied_label
+
+  install_required_command curl || return 1
+  install_required_command jq || return 1
+  cf_find_zone_for_host "$site_domain" || return 1
+
+  response="$(cf_api_request GET "/zones/${CF_ZONE_ID}/dns_records?name=${site_domain}&per_page=100")" || return 1
+  [[ "$proxied" == "true" ]] && proxied_json="true" || proxied_json="false"
+  [[ "$proxied_json" == "true" ]] && proxied_label="橙云代理" || proxied_label="灰云直连"
+
+  conflict_ids="$(printf '%s' "$response" | jq -r '.result[]? | select(.type != "A" and .type != "TXT" and .type != "MX") | .id' 2>/dev/null)"
+  if [[ -n "$conflict_ids" ]]; then
+    yellow "检测到 ${site_domain} 存在非 A 记录冲突，正在改为 ${proxied_label} A 记录。"
+    for cid in $conflict_ids; do
+      cf_api_request DELETE "/zones/${CF_ZONE_ID}/dns_records/${cid}" >/dev/null || return 1
+    done
+    response="$(cf_api_request GET "/zones/${CF_ZONE_ID}/dns_records?name=${site_domain}&per_page=100")" || return 1
+  fi
+
+  record_id="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].id // empty' 2>/dev/null)"
+  record_ip="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].content // empty' 2>/dev/null)"
+  record_proxied="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].proxied // empty' 2>/dev/null)"
+  extra_a_ids="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][1:][]?.id' 2>/dev/null)"
+  if [[ -n "$extra_a_ids" ]]; then
+    yellow "检测到 ${site_domain} 存在多条 A 记录，正在移除多余记录以避免解析到旧 IP。"
+    for cid in $extra_a_ids; do
+      cf_api_request DELETE "/zones/${CF_ZONE_ID}/dns_records/${cid}" >/dev/null || return 1
+    done
+  fi
+
+  data="$(jq -nc --arg type "A" --arg name "$site_domain" --arg content "$vps_ip" --argjson proxied "$proxied_json" \
+    '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')"
+  if [[ -n "$record_id" ]]; then
+    if [[ "$record_ip" == "$vps_ip" && "$record_proxied" == "$proxied_json" ]]; then
+      green "Cloudflare DNS 已存在: ${site_domain} -> ${vps_ip} (${proxied_label})"
+      return 0
+    fi
+    yellow "检测到已有 A 记录: ${site_domain} -> ${record_ip:-unknown}，正在改为 ${vps_ip} (${proxied_label})。"
+    cf_api_request PUT "/zones/${CF_ZONE_ID}/dns_records/${record_id}" "$data" >/dev/null
+  else
+    yellow "正在创建 Cloudflare DNS A 记录: ${site_domain} -> ${vps_ip} (${proxied_label})。"
+    cf_api_request POST "/zones/${CF_ZONE_ID}/dns_records" "$data" >/dev/null
+  fi
+  green "Cloudflare DNS 已配置: ${site_domain} -> ${vps_ip} (${proxied_label})"
+}
+
+ensure_cloudflare_site_dns() {
+  local vps_ip
+  if [[ -z "${CF_API_TOKEN:-}" ]]; then
+    yellow "未提供 Cloudflare API Token，跳过 DNS 自动配置。"
+    return 0
+  fi
+  vps_ip="${SITE_VPS_IP:-}"
+  if [[ -z "$vps_ip" ]]; then
+    vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  fi
+  [[ -n "$vps_ip" ]] || { red "未能检测 VPS 公网 IPv4，无法自动配置 Cloudflare DNS。"; return 1; }
+  SITE_VPS_IP="$vps_ip"
+  yellow "正在使用 Cloudflare API 确认 DNS: ${SITE_DOMAIN} -> ${vps_ip} (灰云)"
+  cf_upsert_site_dns "$SITE_DOMAIN" "$vps_ip" false
 }
 
 install_nginx_if_needed() {
@@ -283,6 +452,7 @@ ensure_real_certificate() {
   yellow "未检测到 ${SITE_DOMAIN} 的有效真实证书，开始申请 Let's Encrypt 证书。"
   yellow "请确认域名 A/AAAA 记录已指向本机，并且 TCP 80/443 已放行。"
   install_certbot_if_needed || return 1
+  ensure_cloudflare_site_dns || return 1
   write_http_nginx_config
   reload_nginx || return 1
 

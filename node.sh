@@ -652,7 +652,7 @@ mask_site_script_fetch_url() {
 }
 
 run_remote_mask_site_script() {
-  local action="$1" tmp_script patched_script url rc auto_domain
+  local action="$1" tmp_script patched_script url rc auto_domain vps_ip
   command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法拉取远程站点脚本。"; return 1; }
   url="$(mask_site_script_fetch_url)"
   yellow "正在从远程加载站点脚本：${MASK_SITE_SCRIPT_URL}"
@@ -688,9 +688,14 @@ run_remote_mask_site_script() {
   fi
 
   if [[ "$action" == "deploy" && -n "$auto_domain" ]]; then
+    vps_ip="${SITE_VPS_IP:-}"
+    if [[ -z "$vps_ip" ]]; then
+      vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+    fi
     printf '\n' | \
       SITE_DOMAIN="$auto_domain" DOMAIN="$auto_domain" SNI_VAL="${SNI_VAL:-$auto_domain}" \
       SELF_SIGN_CERT="${SELF_SIGN_CERT:-1}" USE_CF_ORIGIN_CA_CERT="${USE_CF_ORIGIN_CA_CERT:-0}" \
+      CF_API_TOKEN="${CF_API_TOKEN:-}" SITE_VPS_IP="${SITE_VPS_IP:-$vps_ip}" \
       bash "$tmp_script" "$action"
   else
     bash "$tmp_script" "$action"
@@ -1030,20 +1035,48 @@ cf_configure_cdn_vmess() {
 
 cf_upsert_site_dns() {
   local site_domain="$1" vps_ip="$2" proxied="${3:-false}"
-  local response record_id data zone_id proxied_json
-  install_required_command jq || return 1
+  local response record_id record_ip record_proxied extra_a_ids conflict_ids cid data zone_id proxied_json proxied_label
+  ensure_packages_for_commands curl jq || return 1
   cf_find_zone_for_host "$site_domain" || return 1
   zone_id="$ARGO_CF_ZONE_ID"
   response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${site_domain}&per_page=100")" || return 1
-  record_id="$(printf '%s' "$response" | jq -r '.result[]? | select(.type == "A") | .id' 2>/dev/null | head -1)"
   [[ "$proxied" == "true" ]] && proxied_json="true" || proxied_json="false"
+  [[ "$proxied_json" == "true" ]] && proxied_label="橙云代理" || proxied_label="灰云直连"
+
+  conflict_ids="$(printf '%s' "$response" | jq -r '.result[]? | select(.type != "A" and .type != "TXT" and .type != "MX") | .id' 2>/dev/null)"
+  if [[ -n "$conflict_ids" ]]; then
+    yellow "检测到 ${site_domain} 存在非 A 记录冲突，正在改为 ${proxied_label} A 记录。"
+    for cid in $conflict_ids; do
+      cf_api_request DELETE "/zones/${zone_id}/dns_records/${cid}" >/dev/null || return 1
+    done
+    response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${site_domain}&per_page=100")" || return 1
+  fi
+
+  record_id="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].id // empty' 2>/dev/null)"
+  record_ip="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].content // empty' 2>/dev/null)"
+  record_proxied="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][0].proxied // empty' 2>/dev/null)"
+  extra_a_ids="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "A")][1:][]?.id' 2>/dev/null)"
+  if [[ -n "$extra_a_ids" ]]; then
+    yellow "检测到 ${site_domain} 存在多条 A 记录，正在移除多余记录以避免解析到旧 IP。"
+    for cid in $extra_a_ids; do
+      cf_api_request DELETE "/zones/${zone_id}/dns_records/${cid}" >/dev/null || return 1
+    done
+  fi
+
   data="$(jq -nc --arg type "A" --arg name "$site_domain" --arg content "$vps_ip" --argjson proxied "$proxied_json" \
     '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')"
   if [[ -n "$record_id" ]]; then
+    if [[ "$record_ip" == "$vps_ip" && "$record_proxied" == "$proxied_json" ]]; then
+      green "Cloudflare DNS 已存在: ${site_domain} -> ${vps_ip} (${proxied_label})"
+      return 0
+    fi
+    yellow "检测到已有 A 记录: ${site_domain} -> ${record_ip:-unknown}，正在改为 ${vps_ip} (${proxied_label})。"
     cf_api_request PUT "/zones/${zone_id}/dns_records/${record_id}" "$data" >/dev/null
   else
+    yellow "正在创建 Cloudflare DNS A 记录: ${site_domain} -> ${vps_ip} (${proxied_label})。"
     cf_api_request POST "/zones/${zone_id}/dns_records" "$data" >/dev/null
   fi
+  green "Cloudflare DNS 已配置: ${site_domain} -> ${vps_ip} (${proxied_label})"
 }
 
 issue_cf_origin_certificate() {
@@ -1419,6 +1452,7 @@ configure_domain_certificate_with_config() {
     read -r -p "未能自动检测 VPS IP，请手动输入: " vps_ip
     [[ -n "$vps_ip" ]] || { red "VPS IP 不能为空。"; return 1; }
   fi
+  SITE_VPS_IP="$vps_ip"
 
   if [[ -n "${CF_API_TOKEN:-}" ]]; then
     yellow "正在添加/更新主域名 DNS A 记录: ${DOMAIN} -> ${vps_ip} (灰云)"

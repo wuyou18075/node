@@ -39,6 +39,82 @@ green() { printf '\e[32m%s\e[0m\n' "$*"; }
 yellow() { printf '\e[33m%s\e[0m\n' "$*"; }
 cyan() { printf '\e[36m%s\e[0m\n' "$*"; }
 
+package_list_contains() {
+  local needle="$1" pkg
+  shift || true
+  for pkg in "$@"; do
+    [[ "$pkg" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+install_packages() {
+  local pkgs=("$@")
+  [[ "${#pkgs[@]}" -gt 0 ]] || return 0
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "${pkgs[@]}" >/dev/null 2>&1 || {
+      if package_list_contains jq "${pkgs[@]}"; then
+        dnf install -y epel-release >/dev/null 2>&1 || true
+        dnf install -y "${pkgs[@]}" >/dev/null 2>&1
+      else
+        return 1
+      fi
+    }
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "${pkgs[@]}" >/dev/null 2>&1 || {
+      if package_list_contains jq "${pkgs[@]}"; then
+        yum install -y epel-release >/dev/null 2>&1 || true
+        yum install -y "${pkgs[@]}" >/dev/null 2>&1
+      else
+        return 1
+      fi
+    }
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "${pkgs[@]}" >/dev/null 2>&1
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install -y "${pkgs[@]}" >/dev/null 2>&1
+  else
+    red "未找到支持的包管理器，无法自动安装依赖: ${pkgs[*]}"
+    return 1
+  fi
+}
+
+ensure_packages_for_commands() {
+  local item cmd pkg missing_cmds=() missing_pkgs=()
+
+  for item in "$@"; do
+    cmd="${item%%:*}"
+    pkg="${item#*:}"
+    [[ "$pkg" == "$item" ]] && pkg="$cmd"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_cmds+=("$cmd")
+      missing_pkgs+=("$pkg")
+    fi
+  done
+
+  [[ "${#missing_pkgs[@]}" -eq 0 ]] && return 0
+
+  yellow "缺少依赖: ${missing_cmds[*]}，正在自动安装..."
+  install_packages "${missing_pkgs[@]}" || {
+    red "依赖安装失败，请手动安装: ${missing_pkgs[*]}"
+    return 1
+  }
+
+  for item in "$@"; do
+    cmd="${item%%:*}"
+    command -v "$cmd" >/dev/null 2>&1 || {
+      red "依赖 ${cmd} 仍不可用，请手动安装后重试。"
+      return 1
+    }
+  done
+}
+
 # 核心二进制与环境准备
 sing_box_cmd() {
   [[ -x "$SING_BOX_BIN" ]] && echo "$SING_BOX_BIN"
@@ -755,8 +831,7 @@ cf_is_standard_http_port() {
 cf_configure_cdn_vmess() {
   local cdn_domain="$1" origin_port="$2" vps_ip="$3" need_origin_rule="$4"
 
-  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
-  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
+  ensure_packages_for_commands curl jq || return 1
 
   yellow "正在查找 Cloudflare Zone: ${cdn_domain}"
   cf_find_zone_for_host "$cdn_domain" || return 1
@@ -783,8 +858,7 @@ cf_configure_cdn_vmess() {
 
 cf_configure_named_tunnel() {
   local tunnel_name
-  command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法调用 Cloudflare API。"; return 1; }
-  command -v curl >/dev/null 2>&1 || { red "缺少 curl，无法调用 Cloudflare API。"; return 1; }
+  ensure_packages_for_commands curl jq || return 1
 
   yellow "正在查找 Cloudflare Zone..."
   cf_find_zone_for_host "$ARGO_FIXED_DOMAIN" || return 1
@@ -1217,6 +1291,7 @@ write_sing_box_service() {
 write_sing_box_config() {
   local public_listen tmp_cfg vmess_listen
 
+  ensure_packages_for_commands jq || return 1
   install_sing_box || { red "sing-box 核心安装失败，无法继续！"; return 1; }
   disable_legacy_protocol_services
 
@@ -2381,6 +2456,8 @@ build_hysteria2_share_files() {
 
 install_cloudflared_binary() {
   local tag asset tmp_dir url release_json
+
+  ensure_packages_for_commands curl jq || return 1
 
   if [[ -x "$CLOUDFLARED_BIN" ]]; then
     "$CLOUDFLARED_BIN" version | head -n 1 || true
