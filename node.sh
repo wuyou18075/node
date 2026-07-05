@@ -6005,15 +6005,45 @@ do_one_click_all_with_cdn() {
     fi
     _used_ports+=("$_port_val")
   done
-  if [[ "$cf_proxy" == "0" && "$no_cf_mode" != "1" ]]; then
+
+  local recommended_cdn_domain cdn_domain_input cdn_requested="1"
+  if [[ "$no_cf_mode" == "1" ]]; then
+    cdn_requested="0"
+    CDN_VMESS_ENABLED="0"
+    CDN_VMESS_CDN_DOMAIN=""
+    CDN_VMESS_VIA_NGINX="0"
+    CDN_VMESS_CLIENT_PORT=""
+    CDN_VMESS_ORIGIN_PORT=""
+  else
+    # ===== 第5步: CDN 加速域名 =====
+    echo ""
+    cyan "--- CDN+VMess+WS 配置 ---"
+    recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
+    if [[ -n "$recommended_cdn_domain" ]]; then
+      read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain},输入0跳过]: " cdn_domain_input
+      cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
+    else
+      read -r -p "请输入 CDN 加速域名 (如 cdn.example.com, 输入0跳过): " cdn_domain_input
+    fi
+    cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+    if [[ "$cdn_domain_input" == "0" ]]; then
+      yellow "跳过 CDN+VMess+WS。"
+      cdn_requested="0"
+      cdn_domain_input=""
+      CDN_VMESS_ENABLED="0"
+    elif [[ -z "$cdn_domain_input" ]]; then
+      red "CDN 域名不能为空。"
+      return 1
+    else
+      CDN_VMESS_ENABLED="1"
+    fi
+  fi
+
+  if [[ "$cf_proxy" == "0" && "$no_cf_mode" != "1" && "$cdn_requested" == "1" ]]; then
     echo ""
     cyan "--- CDN+VMess+WS 端口配置 ---"
     configure_cdn_vmess_proxy_ports "$saved_cdn_vmess_client_port" "$saved_cdn_vmess_origin_port" "$saved_cdn_vmess_port" || return 1
   fi
-
-  # ===== 第5步: 节点名前缀 =====
-  echo ""
-  prompt_node_prefix_with_config
 
   if [[ "$no_cf_mode" == "1" ]]; then
     ARGO_ENABLED="0"
@@ -6023,7 +6053,7 @@ do_one_click_all_with_cdn() {
     ARGO_DOMAIN=""
     ARGO_LOCAL_PORT=""
   else
-    # ===== 第6步: Argo 隧道域名 =====
+    # ===== 第7步: Argo 隧道域名 =====
     echo ""
     cyan "--- Argo 隧道配置 ---"
     echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
@@ -6064,41 +6094,16 @@ do_one_click_all_with_cdn() {
     fi
   fi
 
-  local recommended_cdn_domain cdn_domain_input cdn_requested="1"
-  if [[ "$no_cf_mode" == "1" ]]; then
-    cdn_requested="0"
-    CDN_VMESS_ENABLED="0"
-    CDN_VMESS_CDN_DOMAIN=""
-    CDN_VMESS_VIA_NGINX="0"
-    CDN_VMESS_CLIENT_PORT=""
-    CDN_VMESS_ORIGIN_PORT=""
-  else
-    # ===== 第7步: CDN 加速域名 =====
-    echo ""
-    cyan "--- CDN+VMess+WS 配置 ---"
-    recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
-    if [[ -n "$recommended_cdn_domain" ]]; then
-      read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
-      cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
-    else
-      read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
-    fi
-    cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
-    if [[ "$cdn_domain_input" == "0" ]]; then
-      yellow "跳过 CDN+VMess+WS。"
-      cdn_requested="0"
-      cdn_domain_input=""
-    elif [[ -z "$cdn_domain_input" ]]; then
-      red "CDN 域名不能为空。"
-      return 1
-    fi
-  fi
+  # ===== 第8步: 节点名前缀 =====
+  echo ""
+  prompt_node_prefix_with_config
 
   echo ""
   local cdn_need_origin_rule="0"
   if [[ "$cdn_requested" != "1" ]]; then
     CDN_VMESS_ENABLED="0"
   elif [[ "$cf_proxy" == "0" ]]; then
+    CDN_VMESS_ENABLED="1"
     cdn_need_origin_rule="$(cdn_vmess_origin_rule_flag)"
     if [[ "$no_cf_mode" == "1" ]]; then
       echo "手动橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CDN -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
@@ -6106,6 +6111,7 @@ do_one_click_all_with_cdn() {
       echo "橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CF -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
     fi
   else
+    CDN_VMESS_ENABLED="1"
     echo "CDN 端口模式:"
     echo "  A) CF 标准 HTTP 端口 (无需 Origin Rules)"
     echo "  B) 自定义端口 ${CDN_VMESS_PORT} (需要 Origin Rules 权限)"
@@ -6157,7 +6163,11 @@ do_one_click_all_with_cdn() {
   SS2022_ENABLED="0"
   VMESS_ENABLED="1"
   TUIC_ENABLED="1"
-  [[ "${CDN_VMESS_ENABLED:-1}" == "0" ]] || CDN_VMESS_ENABLED="1"
+  if [[ "$cdn_requested" == "1" ]]; then
+    CDN_VMESS_ENABLED="1"
+  else
+    CDN_VMESS_ENABLED="0"
+  fi
 
   HY2_TLS_SNI="$SNI_VAL"
   TUIC_TLS_SNI="$SNI_VAL"
@@ -6219,7 +6229,7 @@ do_one_click_all_with_cdn() {
       yellow "请自行将 ${CDN_VMESS_CDN_DOMAIN} 指向本机，并按需开启橙云；回源端口使用 $(cdn_vmess_origin_port)，客户端端口使用 $(cdn_vmess_client_port)。"
     else
       if [[ "$CDN_VMESS_CF_PROXY" == "1" ]]; then
-        echo "正在配置 CDN+VMess+WS 的 Cloudflare 黄云 DNS..."
+        echo "正在配置 CDN+VMess+WS 的 Cloudflare 橙云 DNS..."
       else
         echo "正在配置 CDN+VMess+WS 的 Cloudflare 灰云 DNS..."
       fi
