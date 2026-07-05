@@ -567,6 +567,43 @@ cert_is_client_trusted() {
   cert_is_publicly_trusted "$verify_domain" || cert_is_cf_origin_ca
 }
 cert_files_exist() { [[ -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; }
+domain_resolves_to_ip() {
+  local domain="$1" expected_ip="$2" output
+
+  if command -v ping >/dev/null 2>&1; then
+    output="$(ping -4 -c 1 -W 1 "$domain" 2>/dev/null || true)"
+    if printf '%s\n' "$output" | sed -nE 's/^PING .*\(([0-9.]+)\).*/\1/p' | grep -Fxq "$expected_ip"; then
+      return 0
+    fi
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | grep -Fxq "$expected_ip" && return 0
+  fi
+
+  if command -v dig >/dev/null 2>&1; then
+    dig +short A "$domain" 2>/dev/null | grep -Fxq "$expected_ip" && return 0
+  fi
+
+  return 1
+}
+wait_for_domain_resolve_to_ip() {
+  local domain="$1" expected_ip="$2" attempts="${3:-3}" delay="${4:-1}" i
+
+  for ((i = 1; i <= attempts; i++)); do
+    if domain_resolves_to_ip "$domain" "$expected_ip"; then
+      green "DNS 解析已生效: ${domain} -> ${expected_ip}"
+      return 0
+    fi
+    if (( i < attempts )); then
+      yellow "DNS 解析尚未生效，${delay} 秒后重试 (${i}/${attempts})..."
+      sleep "$delay"
+    fi
+  done
+
+  red "连续 ${attempts} 次未检测到 ${domain} 解析到本机 IP ${expected_ip}。"
+  return 1
+}
 detect_cert_primary_name() {
   local san cn
   cert_files_exist || return 1
@@ -1597,7 +1634,7 @@ generate_self_signed_domain_cert() {
 }
 
 configure_domain_certificate_with_config() {
-  local attempt input_domain use_existing vps_ip
+  local input_domain use_existing vps_ip
 
   if confirm_reuse_config_value DOMAIN "主域名"; then
     input_domain="$DOMAIN"
@@ -1647,6 +1684,7 @@ configure_domain_certificate_with_config() {
   if [[ -n "${CF_API_TOKEN:-}" ]]; then
     yellow "正在添加/更新主域名 DNS A 记录: ${DOMAIN} -> ${vps_ip} (灰云)"
     cf_upsert_site_dns "$DOMAIN" "$vps_ip" false || return 1
+    wait_for_domain_resolve_to_ip "$DOMAIN" "$vps_ip" 3 1 || return 1
   else
     yellow "未配置 Cloudflare API Token，跳过 DNS 自动配置；请确认 ${DOMAIN} 已解析到 ${vps_ip}。"
   fi
@@ -1654,18 +1692,7 @@ configure_domain_certificate_with_config() {
   SITE_ENABLED="1"
   USE_CF_ORIGIN_CA_CERT="0"
   save_state
-  for attempt in 1 2 3; do
-    if install_mask_site_nginx && cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
-      break
-    fi
-    if [[ "$attempt" -lt 3 ]]; then
-      yellow "证书暂未生效，1 秒后重试 (${attempt}/3)..."
-      sleep 1
-    else
-      red "连续 3 次未检测到 ${DOMAIN} 的可用证书。"
-      return 1
-    fi
-  done
+  install_mask_site_nginx || return 1
   if cert_files_exist && cert_matches_domain && cert_is_currently_valid; then
     if cert_is_publicly_trusted "$DOMAIN"; then
       SELF_SIGN_CERT="0"
@@ -1942,17 +1969,6 @@ normalize_argo_tunnel_state() {
   select_argo_edge_server
 }
 pick_subscription_port() {
-  local p
-
-  if [[ "${SUB_CF_PROXY:-0}" == "1" && "${SELF_SIGN_CERT:-0}" != "1" && -n "${DOMAIN:-}" ]]; then
-    for p in 2053 2083 2087 2096 8443 443; do
-      if ! port_in_use "$p"; then
-        SUB_PORT="$p"
-        return 0
-      fi
-    done
-  fi
-
   SUB_PORT="$(pick_free_port 50000 60000)"
 }
 port_in_use() {
@@ -2133,26 +2149,20 @@ is_valid_port() {
 }
 
 read_subscription_port() {
-  local input_port default_hint
-
-  if [[ "${SUB_CF_PROXY:-0}" == "1" && "${SELF_SIGN_CERT:-0}" != "1" && -n "${DOMAIN:-}" ]]; then
-    default_hint="留空优先自动选择 CF 支持的 HTTPS 端口 2053/2083/2087/2096/8443，均被占用再随机 50000-60000"
-  else
-    default_hint="留空随机 50000-60000"
-  fi
+  local input_port
 
   while :; do
-    read -r -p "请输入订阅链接端口 (${default_hint}): " input_port
+    read -r -p "请输入订阅链接端口 (50000-60000):回车随机 " input_port
     if [[ -z "$input_port" ]]; then
       pick_subscription_port || SUB_PORT="$(shuf -i 50000-60000 -n 1)"
       echo "已自动生成订阅链接端口: $SUB_PORT"
       return 0
     fi
-    if is_valid_port "$input_port"; then
+    if is_valid_port "$input_port" && (( 10#$input_port >= 50000 && 10#$input_port <= 60000 )); then
       SUB_PORT="$input_port"
       return 0
     fi
-    red "端口无效，请输入 1-65535 的数字。"
+    red "端口无效，请输入 50000-60000 的数字。"
   done
 }
 
