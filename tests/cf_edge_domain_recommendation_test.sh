@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script="${1:-node.sh}"
+
+source <(sed '/^# 启动入口执行/,$ d' "$script")
+
+ARGO_CF_ZONE_NAME="cj7.kdns.fr"
+
+[[ "$(recommend_argo_domain "gf7.cj7.kdns.fr")" == "argo-gf7.cj7.kdns.fr" ]] || {
+  echo "Argo recommendation must stay one label below the Cloudflare zone" >&2
+  exit 1
+}
+
+[[ "$(recommend_cdn_domain "gf7.cj7.kdns.fr")" == "cdn-gf7.cj7.kdns.fr" ]] || {
+  echo "CDN recommendation must stay one label below the Cloudflare zone" >&2
+  exit 1
+}
+
+ARGO_CF_ZONE_NAME=""
+
+[[ "$(recommend_argo_domain "aaa.bbb.com")" == "argo.aaa.bbb.com" ]] || {
+  echo "Argo recommendation must preserve the legacy fallback without zone context" >&2
+  exit 1
+}
+
+[[ "$(recommend_cdn_domain "aaa.bbb.com")" == "cdn.aaa.bbb.com" ]] || {
+  echo "CDN recommendation must preserve the legacy fallback without zone context" >&2
+  exit 1
+}

@@ -802,18 +802,45 @@ cf_put_tunnel_public_hostname() {
 }
 
 cf_upsert_tunnel_dns() {
-  local response record_id data content
+  local response record_id record_content record_proxied extra_cname_ids conflict_ids cid data content
   content="${ARGO_TUNNEL_ID}.cfargotunnel.com"
   response="$(cf_api_request GET "/zones/${ARGO_CF_ZONE_ID}/dns_records?name=${ARGO_FIXED_DOMAIN}&per_page=100")" || return 1
-  record_id="$(printf '%s' "$response" | jq -r '.result[0].id // empty')"
+
+  conflict_ids="$(printf '%s' "$response" | jq -r '.result[]? | select(.type != "CNAME") | .id' 2>/dev/null)"
+  if [[ -n "$conflict_ids" ]]; then
+    yellow "检测到 ${ARGO_FIXED_DOMAIN} 存在非 CNAME 记录，正在改为 Cloudflare Tunnel CNAME。"
+    for cid in $conflict_ids; do
+      cf_api_request DELETE "/zones/${ARGO_CF_ZONE_ID}/dns_records/${cid}" >/dev/null || return 1
+    done
+    response="$(cf_api_request GET "/zones/${ARGO_CF_ZONE_ID}/dns_records?name=${ARGO_FIXED_DOMAIN}&per_page=100")" || return 1
+  fi
+
+  record_id="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "CNAME")][0].id // empty' 2>/dev/null)"
+  record_content="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "CNAME")][0].content // empty' 2>/dev/null)"
+  record_proxied="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "CNAME")][0].proxied // empty' 2>/dev/null)"
+  extra_cname_ids="$(printf '%s' "$response" | jq -r '[.result[]? | select(.type == "CNAME")][1:][]?.id' 2>/dev/null)"
+  if [[ -n "$extra_cname_ids" ]]; then
+    yellow "检测到 ${ARGO_FIXED_DOMAIN} 存在多条 CNAME，正在移除多余记录。"
+    for cid in $extra_cname_ids; do
+      cf_api_request DELETE "/zones/${ARGO_CF_ZONE_ID}/dns_records/${cid}" >/dev/null || return 1
+    done
+  fi
+
   data="$(jq -nc --arg type "CNAME" --arg name "$ARGO_FIXED_DOMAIN" --arg content "$content" \
     '{type:$type,name:$name,content:$content,ttl:1,proxied:true}')"
 
   if [[ -n "$record_id" ]]; then
+    if [[ "$record_content" == "$content" && "$record_proxied" == "true" ]]; then
+      green "Cloudflare Tunnel DNS 已存在: ${ARGO_FIXED_DOMAIN} -> ${content}"
+      return 0
+    fi
+    yellow "正在更新 Cloudflare Tunnel CNAME: ${ARGO_FIXED_DOMAIN} -> ${content}"
     cf_api_request PUT "/zones/${ARGO_CF_ZONE_ID}/dns_records/${record_id}" "$data" >/dev/null
   else
+    yellow "正在创建 Cloudflare Tunnel CNAME: ${ARGO_FIXED_DOMAIN} -> ${content}"
     cf_api_request POST "/zones/${ARGO_CF_ZONE_ID}/dns_records" "$data" >/dev/null
   fi
+  green "Cloudflare Tunnel DNS 已配置: ${ARGO_FIXED_DOMAIN} -> ${content}"
 }
 
 # =============================================================================
@@ -1395,16 +1422,28 @@ confirm_reuse_config_value() {
   return 0
 }
 
-recommend_argo_domain() {
-  local base="$1"
+recommend_cf_edge_domain() {
+  local prefix="$1" base="$2" zone="${ARGO_CF_ZONE_NAME:-}" left
   [[ -n "$base" ]] || return 1
-  printf 'argo.%s\n' "$base"
+  if [[ -n "$zone" && "$base" == "$zone" ]]; then
+    printf '%s.%s\n' "$prefix" "$zone"
+    return 0
+  fi
+  if [[ -n "$zone" && "$base" == *".${zone}" ]]; then
+    left="${base%.$zone}"
+    left="${left//./-}"
+    printf '%s-%s.%s\n' "$prefix" "$left" "$zone"
+    return 0
+  fi
+  printf '%s.%s\n' "$prefix" "$base"
+}
+
+recommend_argo_domain() {
+  recommend_cf_edge_domain argo "$1"
 }
 
 recommend_cdn_domain() {
-  local base="$1"
-  [[ -n "$base" ]] || return 1
-  printf 'cdn.%s\n' "$base"
+  recommend_cf_edge_domain cdn "$1"
 }
 
 generate_self_signed_domain_cert() {
@@ -5657,6 +5696,9 @@ do_one_click_all_with_cdn() {
   # ===== 第3步: 主域名和证书 =====
   echo ""
   configure_domain_certificate_with_config || return 1
+  if [[ -n "${CF_API_TOKEN:-}" && -n "${DOMAIN:-}" && -z "${ARGO_CF_ZONE_NAME:-}" ]]; then
+    cf_find_zone_for_host "$DOMAIN" >/dev/null 2>&1 || true
+  fi
 
   # ===== 第4步: 端口分配（7个协议: HY2/SS/VMess/TUIC/AnyTLS/VLESS + CDN-VMess） =====
   echo ""
