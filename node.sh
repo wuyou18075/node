@@ -937,14 +937,16 @@ cf_upsert_tunnel_dns() {
 
 cf_upsert_cdn_vmess_dns() {
   local cdn_domain="$1" vps_ip="$2" zone_id="$3" proxied="${4:-1}"
-  local response record_id record_type data conflict_ids proxied_json proxied_label
+  local response record_id record_type data conflict_ids proxied_json proxied_label ttl
 
   if [[ "$proxied" == "1" ]]; then
     proxied_json="true"
     proxied_label="橙云代理"
+    ttl="1"
   else
     proxied_json="false"
     proxied_label="灰云直连"
+    ttl="60"
   fi
 
   # 查询该域名下所有类型的 DNS 记录
@@ -962,8 +964,8 @@ cf_upsert_cdn_vmess_dns() {
 
   # 查找现有 A 记录
   record_id="$(printf '%s' "$response" | jq -r '.result[]? | select(.type == "A") | .id' 2>/dev/null | head -1)"
-  data="$(jq -nc --arg type "A" --arg name "$cdn_domain" --arg content "$vps_ip" --argjson proxied "$proxied_json" \
-    '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')"
+  data="$(jq -nc --arg type "A" --arg name "$cdn_domain" --arg content "$vps_ip" --arg ttl "$ttl" --argjson proxied "$proxied_json" \
+    '{type:$type,name:$name,content:$content,ttl:($ttl | tonumber),proxied:$proxied}')"
 
   if [[ -n "$record_id" ]]; then
     yellow "更新已有 A 记录: ${cdn_domain} -> ${vps_ip} (${proxied_label})"
@@ -1213,13 +1215,20 @@ cf_configure_cdn_vmess() {
 
 cf_upsert_site_dns() {
   local site_domain="$1" vps_ip="$2" proxied="${3:-false}"
-  local response record_id record_ip record_proxied extra_a_ids conflict_ids cid data zone_id proxied_json proxied_label
+  local response record_id record_ip record_proxied extra_a_ids conflict_ids cid data zone_id proxied_json proxied_label ttl
   ensure_packages_for_commands curl jq || return 1
   cf_find_zone_for_host "$site_domain" || return 1
   zone_id="$ARGO_CF_ZONE_ID"
   response="$(cf_api_request GET "/zones/${zone_id}/dns_records?name=${site_domain}&per_page=100")" || return 1
-  [[ "$proxied" == "true" ]] && proxied_json="true" || proxied_json="false"
-  [[ "$proxied_json" == "true" ]] && proxied_label="橙云代理" || proxied_label="灰云直连"
+  if [[ "$proxied" == "true" ]]; then
+    proxied_json="true"
+    proxied_label="橙云代理"
+    ttl="1"
+  else
+    proxied_json="false"
+    proxied_label="灰云直连"
+    ttl="60"
+  fi
 
   conflict_ids="$(printf '%s' "$response" | jq -r '.result[]? | select(.type != "A" and .type != "TXT" and .type != "MX") | .id' 2>/dev/null)"
   if [[ -n "$conflict_ids" ]]; then
@@ -1241,8 +1250,8 @@ cf_upsert_site_dns() {
     done
   fi
 
-  data="$(jq -nc --arg type "A" --arg name "$site_domain" --arg content "$vps_ip" --argjson proxied "$proxied_json" \
-    '{type:$type,name:$name,content:$content,ttl:1,proxied:$proxied}')"
+  data="$(jq -nc --arg type "A" --arg name "$site_domain" --arg content "$vps_ip" --arg ttl "$ttl" --argjson proxied "$proxied_json" \
+    '{type:$type,name:$name,content:$content,ttl:($ttl | tonumber),proxied:$proxied}')"
   if [[ -n "$record_id" ]]; then
     if [[ "$record_ip" == "$vps_ip" && "$record_proxied" == "$proxied_json" ]]; then
       green "Cloudflare DNS 已存在: ${site_domain} -> ${vps_ip} (${proxied_label})"
@@ -1741,7 +1750,7 @@ configure_domain_certificate_with_config() {
   if [[ -n "${CF_API_TOKEN:-}" ]]; then
     yellow "正在添加/更新主域名 DNS A 记录: ${DOMAIN} -> ${vps_ip} (灰云)"
     cf_upsert_site_dns "$DOMAIN" "$vps_ip" false || return 1
-    wait_for_domain_resolve_to_ip "$DOMAIN" "$vps_ip" 3 1 || return 1
+    wait_for_domain_resolve_to_ip "$DOMAIN" "$vps_ip" 6 30 || return 1
   else
     yellow "未配置 Cloudflare API Token，跳过 DNS 自动配置；请确认 ${DOMAIN} 已解析到 ${vps_ip}。"
   fi

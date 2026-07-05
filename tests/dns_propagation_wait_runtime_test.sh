@@ -21,7 +21,7 @@ cf_upsert_site_dns() {
 }
 sleep() {
   sleep_count="$((sleep_count + 1))"
-  [[ "$1" == "1" ]]
+  [[ "$1" == "30" ]]
 }
 
 cert_files_exist() { [[ "${site_installed:-0}" == "1" ]]; }
@@ -39,7 +39,7 @@ domain_resolves_to_ip() {
   resolve_count="$((resolve_count + 1))"
   [[ "$1" == "site.example.com" ]]
   [[ "$2" == "203.0.113.9" ]]
-  [[ "$resolve_count" == "3" ]]
+  [[ "$resolve_count" == "6" ]]
 }
 install_mask_site_nginx() {
   site_install_count="$((site_install_count + 1))"
@@ -49,8 +49,8 @@ install_mask_site_nginx() {
 configure_domain_certificate_with_config <<< "site.example.com" >/dev/null
 
 [[ "$dns_upsert" == "site.example.com|203.0.113.9|false" ]]
-[[ "$resolve_count" == "3" ]]
-[[ "$sleep_count" == "2" ]]
+[[ "$resolve_count" == "6" ]]
+[[ "$sleep_count" == "5" ]]
 [[ "$site_install_count" == "1" ]]
 [[ "$SELF_SIGN_CERT" == "0" ]]
 
@@ -71,6 +71,6 @@ if configure_domain_certificate_with_config <<< "site.example.com" >/dev/null 2>
 fi
 
 [[ "$dns_upsert" == "site.example.com|203.0.113.9|false" ]]
-[[ "$resolve_count" == "3" ]]
-[[ "$sleep_count" == "2" ]]
+[[ "$resolve_count" == "6" ]]
+[[ "$sleep_count" == "5" ]]
 [[ "$site_install_count" == "0" ]]

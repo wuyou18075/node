@@ -63,7 +63,7 @@ put_payload="$(awk -F '\t' '$1 == "PUT" && $2 == "/zones/zone_test/dns_records/o
   exit 1
 }
 
-printf '%s' "$put_payload" | jq -e '.type == "A" and .name == "site.example.com" and .content == "203.0.113.9" and .proxied == false and .ttl == 1' >/dev/null || {
-  echo "site DNS upsert must update the record to the VPS IP with DNS-only mode" >&2
+printf '%s' "$put_payload" | jq -e '.type == "A" and .name == "site.example.com" and .content == "203.0.113.9" and .proxied == false and .ttl == 60' >/dev/null || {
+  echo "site DNS upsert must update the record to the VPS IP with DNS-only mode and 60 second TTL" >&2
   exit 1
 }
