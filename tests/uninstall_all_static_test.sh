@@ -13,6 +13,31 @@ if ! grep -q '99 卸载所有脚本产出内容' "$script"; then
   exit 1
 fi
 
+if ! grep -q '确认卸载? \[y/N\]' "$script"; then
+  echo "menu item 99 uninstall confirmation must use y/N with default no" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'if [[ ! "$confirm" =~ ^[Yy]$ ]]; then' "$script"; then
+  echo "menu item 99 must only uninstall when the user explicitly answers y/Y" >&2
+  exit 1
+fi
+
+if ! grep -q '是否清空 node.config? \[y/N\]' "$script"; then
+  echo "menu item 99 must ask whether to clear node.config with default no" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'if [[ "$confirm" =~ ^[Yy]$ ]]; then' "$script"; then
+  echo "menu item 99 must only clear node.config when the user explicitly answers y/Y" >&2
+  exit 1
+fi
+
+if ! grep -q '^clear_node_config_file()' "$script"; then
+  echo "script must provide a reusable node.config clear helper" >&2
+  exit 1
+fi
+
 if ! grep -q '系统网络加速/优化配置' "$script"; then
   echo "uninstall warning must explicitly mention network tuning is removed" >&2
   exit 1

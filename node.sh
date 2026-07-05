@@ -1457,6 +1457,12 @@ save_node_config() {
   rm -f "$tmp"
 }
 
+clear_node_config_file() {
+  mkdir -p "$CONFIG_DIR"
+  : > "$NODE_CONFIG_FILE"
+  chmod 600 "$NODE_CONFIG_FILE" 2>/dev/null || true
+}
+
 show_node_config_path() {
   if [[ -f "$NODE_CONFIG_FILE" ]]; then
     echo "   配置文件: ${NODE_CONFIG_FILE} (存在)"
@@ -1645,9 +1651,7 @@ manage_node_config_menu() {
         require_root || return 1
         read -r -p "确认清空 node.config? (请输入 YES 确认): " confirm
         if [[ "$confirm" == "YES" ]]; then
-          mkdir -p "$CONFIG_DIR"
-          : > "$NODE_CONFIG_FILE"
-          chmod 600 "$NODE_CONFIG_FILE" 2>/dev/null || true
+          clear_node_config_file
           green "node.config 已清空。"
         else
           yellow "已取消。"
@@ -6285,11 +6289,19 @@ main_menu() {
       99)
         echo ""
         red "警告：此操作将卸载 sing-box、所有节点配置、证书、缓存、订阅服务、脚本创建的伪装站和系统网络加速/优化配置！"
-        read -r -p "确认卸载? (请输入 YES 确认): " confirm
-        if [[ "$confirm" != "YES" ]]; then
+        read -r -p "确认卸载? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
           yellow "已取消卸载。"
         else
-          uninstall_all
+          if uninstall_all; then
+            read -r -p "是否清空 node.config? [y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+              clear_node_config_file
+              green "node.config 已清空。"
+            else
+              yellow "保留 node.config。"
+            fi
+          fi
         fi
         echo "按回车键返回主菜单..."
         read -r
