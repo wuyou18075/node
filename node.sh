@@ -1432,7 +1432,7 @@ recommend_cf_edge_domain() {
   if [[ -n "$zone" && "$base" == *".${zone}" ]]; then
     left="${base%.$zone}"
     left="${left//./-}"
-    printf '%s-%s.%s\n' "$prefix" "$left" "$zone"
+    printf '%s%s.%s\n' "$prefix" "$left" "$zone"
     return 0
   fi
   printf '%s.%s\n' "$prefix" "$base"
