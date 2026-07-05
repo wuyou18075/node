@@ -221,6 +221,12 @@ detect_cloudflared_asset() {
 }
 curl_fsSL() { curl -fsSL "$@"; }
 
+node_script_fetch_url() {
+  local sep="?"
+  [[ "$NODE_SCRIPT_URL" == *\?* ]] && sep="&"
+  printf '%s%s_t=%s\n' "$NODE_SCRIPT_URL" "$sep" "${RANDOM}${RANDOM}"
+}
+
 install_required_command() {
   local cmd="$1" pkg="${2:-$1}" manager=""
 
@@ -1461,7 +1467,7 @@ detect_running_argo_tunnel() {
 }
 
 install_self_script() {
-  local src="${BASH_SOURCE[0]:-${SELF_SCRIPT_SOURCE:-$0}}" target="${INSTALL_SCRIPT:-$SELF_INSTALL_SCRIPT}" tmp
+  local src="${BASH_SOURCE[0]:-${SELF_SCRIPT_SOURCE:-$0}}" target="${INSTALL_SCRIPT:-$SELF_INSTALL_SCRIPT}" tmp url
 
   [[ "$target" == /* ]] || target="$SELF_INSTALL_SCRIPT"
   mkdir -p "$(dirname "$target")" || return 1
@@ -1482,18 +1488,24 @@ install_self_script() {
     return 0
   fi
 
-  if [[ -r "$target" ]] && grep -q '^# node.sh - Node generation:' "$target" 2>/dev/null; then
-    INSTALL_SCRIPT="$target"
-    return 0
-  fi
-
   command -v curl >/dev/null 2>&1 || {
-    red "无法安装 systemd 所需脚本: 当前脚本源不可读且缺少 curl。"
+    if [[ -r "$target" ]] && grep -q '^# node.sh - Node generation:' "$target" 2>/dev/null; then
+      yellow "当前脚本源不可读且缺少 curl，暂时复用本地脚本缓存: ${target}"
+      INSTALL_SCRIPT="$target"
+      return 0
+    fi
+    red "无法安装 systemd 所需脚本: 当前脚本源不可读、缺少 curl，且无可用本地缓存。"
     return 1
   }
   tmp="$(mktemp /tmp/agsb-node.XXXXXX.sh)" || return 1
-  if ! curl_fsSL "$NODE_SCRIPT_URL" -o "$tmp"; then
+  url="$(node_script_fetch_url)"
+  if ! curl_fsSL "$url" -o "$tmp"; then
     rm -f "$tmp"
+    if [[ -r "$target" ]] && grep -q '^# node.sh - Node generation:' "$target" 2>/dev/null; then
+      yellow "远程脚本下载失败，暂时复用本地脚本缓存: ${target}"
+      INSTALL_SCRIPT="$target"
+      return 0
+    fi
     red "无法下载 systemd 所需脚本: ${NODE_SCRIPT_URL}"
     return 1
   fi
