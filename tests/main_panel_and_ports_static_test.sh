@@ -26,10 +26,22 @@ require_pattern '1.Hysteria2 2.VMess 3.TUIC 4.AnyTLS 5.VLESS' \
   "one-click CDN flow must remove deprecated SS-2022 and separate CDN-VMess from the shared port prompt"
 require_pattern '全协议cf灰云+橙云+argo+cdn' \
   "main panel option 4 must use the requested label"
-require_pattern '  2) 基础协议(无cf,橙云+argo+cdn版)' \
+require_pattern '  2) 基础协议(无cf版)' \
   "main panel must expose the no-CF basic protocol flow as option 2"
-require_pattern 'do_one_click_all_without_cf_cdn' \
+require_pattern 'do_one_click_all_basic_without_cf' \
   "main panel option 2 must call the no-CF basic protocol flow"
+if grep -q '基础协议(无cf,橙云+argo+cdn版)' "$script"; then
+  echo "no-CF basic flow must not advertise Argo or CDN in its label" >&2
+  exit 1
+fi
+if grep -Eq 'Argo 临时隧道配置 \(无 CF API\)|无 CF 模式不创建 Named Tunnel，自动使用 trycloudflare.com 临时隧道|无 CF 模式只生成节点和 nginx 回源配置' "$script"; then
+  echo "no-CF basic flow must not prompt for Argo temporary tunnel or CDN" >&2
+  exit 1
+fi
+require_pattern 'ARGO_ENABLED="0"' \
+  "no-CF basic flow must explicitly disable Argo"
+require_pattern 'CDN_VMESS_ENABLED="0"' \
+  "no-CF basic flow must explicitly disable CDN-VMess"
 if grep -q '一键全协议+CDN 橙云回源443版' "$script"; then
   echo "menus must not show the old orange-cloud option label" >&2
   exit 1

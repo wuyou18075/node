@@ -5870,8 +5870,8 @@ do_one_click_all_with_cdn() {
 
   if [[ "$cf_api_mode" == "no_cf" ]]; then
     no_cf_mode="1"
-    mode_title="基础协议(无cf,橙云+argo+cdn版)"
-    mode_note="不读取 Cloudflare API Token，不自动配置 DNS/Origin Rules；有域名时申请真实证书，CDN/橙云相关记录需自行配置。"
+    mode_title="基础协议(无cf版)"
+    mode_note="不读取 Cloudflare API Token，不创建 Argo 隧道，不生成 CDN-VMess；仅生成基础直连协议。"
   elif [[ "$cf_proxy" == "0" ]]; then
     mode_title="一键全协议 + 橙云 CDN VMess-WS 回源 443"
     mode_note="CDN-VMess 域名将设置为 Cloudflare 代理/橙云；客户端端口可用 443/2053/2083/2087/2096/8443，源站统一回源 443。"
@@ -5998,7 +5998,7 @@ do_one_click_all_with_cdn() {
     fi
     _used_ports+=("$_port_val")
   done
-  if [[ "$cf_proxy" == "0" && ( "$no_cf_mode" != "1" || -n "${DOMAIN:-}" ) ]]; then
+  if [[ "$cf_proxy" == "0" && "$no_cf_mode" != "1" ]]; then
     echo ""
     cyan "--- CDN+VMess+WS 端口配置 ---"
     configure_cdn_vmess_proxy_ports "$saved_cdn_vmess_client_port" "$saved_cdn_vmess_origin_port" "$saved_cdn_vmess_port" || return 1
@@ -6008,18 +6008,16 @@ do_one_click_all_with_cdn() {
   echo ""
   prompt_node_prefix_with_config
 
-  # ===== 第6步: Argo 隧道域名 =====
-  echo ""
   if [[ "$no_cf_mode" == "1" ]]; then
-    cyan "--- Argo 临时隧道配置 (无 CF API) ---"
-    echo "无 CF 模式不创建 Named Tunnel，自动使用 trycloudflare.com 临时隧道。"
-    ARGO_TUNNEL_MODE="quick"
+    ARGO_ENABLED="0"
+    ARGO_TUNNEL_MODE=""
     ARGO_FIXED_DOMAIN=""
     ARGO_TUNNEL_TOKEN=""
     ARGO_DOMAIN=""
-    pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
-    ARGO_ENABLED="1"
+    ARGO_LOCAL_PORT=""
   else
+    # ===== 第6步: Argo 隧道域名 =====
+    echo ""
     cyan "--- Argo 隧道配置 ---"
     echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
     echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
@@ -6059,19 +6057,19 @@ do_one_click_all_with_cdn() {
     fi
   fi
 
-  # ===== 第7步: CDN 加速域名 =====
-  echo ""
-  cyan "--- CDN+VMess+WS 配置 ---"
   local recommended_cdn_domain cdn_domain_input cdn_requested="1"
-  if [[ "$no_cf_mode" == "1" && -z "${DOMAIN:-}" ]]; then
-    yellow "未输入主域名，跳过 CDN+VMess+WS；直连协议和 Argo 临时隧道仍会生成。"
+  if [[ "$no_cf_mode" == "1" ]]; then
     cdn_requested="0"
+    CDN_VMESS_ENABLED="0"
+    CDN_VMESS_CDN_DOMAIN=""
+    CDN_VMESS_VIA_NGINX="0"
+    CDN_VMESS_CLIENT_PORT=""
+    CDN_VMESS_ORIGIN_PORT=""
   else
+    # ===== 第7步: CDN 加速域名 =====
+    echo ""
+    cyan "--- CDN+VMess+WS 配置 ---"
     recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
-    if [[ "$no_cf_mode" == "1" ]]; then
-      echo "无 CF 模式只生成节点和 nginx 回源配置，不会创建 DNS 或 Origin Rules。"
-      echo "输入 0 可跳过 CDN+VMess+WS。"
-    fi
     if [[ -n "$recommended_cdn_domain" ]]; then
       read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
       cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
@@ -6297,6 +6295,11 @@ do_one_click_all_with_cdn() {
     else
       unset CF_API_TOKEN
     fi
+    ARGO_FIXED_DOMAIN="$saved_argo_domain"
+    CDN_VMESS_CDN_DOMAIN="$saved_cdn_domain"
+    CDN_VMESS_CLIENT_PORT="$saved_cdn_vmess_client_port"
+    CDN_VMESS_ORIGIN_PORT="$saved_cdn_vmess_origin_port"
+    CDN_VMESS_PORT="$saved_cdn_vmess_port"
   fi
   save_node_config
 
@@ -6311,7 +6314,7 @@ do_one_click_all_with_direct_cdn() {
   do_one_click_all_with_cdn 0
 }
 
-do_one_click_all_without_cf_cdn() {
+do_one_click_all_basic_without_cf() {
   do_one_click_all_with_cdn 0 no_cf
 }
 
@@ -6394,7 +6397,7 @@ main_menu() {
     print_sing_box_panel_status
     echo ""
     echo "  1  安装 sing-box"
-    echo "  2) 基础协议(无cf,橙云+argo+cdn版)"
+    echo "  2) 基础协议(无cf版)"
     echo "  3) 创建代理节点"
     echo "  4) 全协议cf灰云+橙云+argo+cdn"
     echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
@@ -6421,8 +6424,8 @@ main_menu() {
         read -r
         ;;
       2)
-        if ! do_one_click_all_without_cf_cdn; then
-          red "基础协议(无cf,橙云+argo+cdn版)安装失败。"
+        if ! do_one_click_all_basic_without_cf; then
+          red "基础协议(无cf版)安装失败。"
         fi
         echo "按回车键返回主菜单..."
         read -r
