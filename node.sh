@@ -606,7 +606,12 @@ configure_domain_certificate() {
     fi
   fi
 
-  read -r -p "请输入域名(留空使用自签证书): " DOMAIN
+  if confirm_reuse_config_value DOMAIN "主域名"; then
+    DOMAIN="$(normalize_argo_host "${DOMAIN:-}")"
+  else
+    read -r -p "请输入域名(留空使用自签证书): " DOMAIN
+    DOMAIN="$(normalize_argo_host "${DOMAIN:-}")"
+  fi
   if [[ -n "$DOMAIN" ]]; then
     if cert_files_exist && cert_matches_domain; then
       if cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
@@ -1076,16 +1081,15 @@ cdn_vmess_client_tls_enabled() {
 }
 
 configure_cdn_vmess_proxy_ports() {
-  local saved_client="${1:-}" saved_origin="${2:-}" saved_local="${3:-}" generated_local input reuse
+  local saved_client="${1:-}" saved_origin="${2:-}" saved_local="${3:-}" input reuse
 
-  generated_local="${CDN_VMESS_PORT:-}"
   if [[ -n "$saved_client$saved_origin$saved_local" ]]; then
-    echo "检测到之前的 CDN 端口配置: 客户端端口 ${saved_client:-443}, 回源端口 ${saved_origin:-443}, 本地入站 ${saved_local:-${generated_local:-未设置}}"
-    read -r -p "是否复用之前的 CDN 端口配置? [Y/n]: " reuse
+    echo "检测到 node.config 中的 CDN 端口配置: 客户端端口 ${saved_client:-443}, 回源端口 ${saved_origin:-443}, 本地入站 ${saved_local:-未设置}"
+    read -r -p "是否复用该 CDN 端口配置? [Y/n]: " reuse
     if [[ ! "$reuse" =~ ^[Nn]$ ]]; then
       CDN_VMESS_CLIENT_PORT="${saved_client:-443}"
       CDN_VMESS_ORIGIN_PORT="${saved_origin:-443}"
-      CDN_VMESS_PORT="${saved_local:-${generated_local:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}}"
+      CDN_VMESS_PORT="${saved_local:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
       CDN_VMESS_CF_PROXY="1"
       CDN_VMESS_VIA_NGINX="1"
       return 0
@@ -1104,7 +1108,7 @@ configure_cdn_vmess_proxy_ports() {
     return 1
   elif cf_is_standard_https_port "$input"; then
     CDN_VMESS_CLIENT_PORT="$input"
-    CDN_VMESS_PORT="${generated_local:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    CDN_VMESS_PORT="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
     echo "CDN 客户端端口: ${CDN_VMESS_CLIENT_PORT}，源站统一回源 443，本地入站端口: ${CDN_VMESS_PORT}"
   else
     if port_in_use "$input"; then
@@ -1344,11 +1348,14 @@ prepare_cf_proxy_mask_site() {
 create_cf_proxy_node() {
   clear
   load_state >/dev/null 2>&1 || true
+  load_node_config >/dev/null 2>&1 || true
+  clear_unconfigured_node_config_values
   cyan "================ Create CF Proxy Node ================"
 
   prompt_common_uuid || return 1
   prompt_cf_api_token || return 1
   CF_PROXY_REUSE_READY="1"
+  save_node_config
   save_state
 
   prepare_cf_proxy_mask_site || return 1
@@ -1356,20 +1363,11 @@ create_cf_proxy_node() {
 }
 
 prompt_cf_api_token() {
-  local input_cf_token use_previous token_len token_tail
+  local input_cf_token
 
-  if [[ -n "${CF_API_TOKEN:-}" ]]; then
-    token_len="${#CF_API_TOKEN}"
-    token_tail="$CF_API_TOKEN"
-    if (( token_len > 6 )); then
-      token_tail="${CF_API_TOKEN: -6}"
-    fi
-    echo "检测到之前使用的 Cloudflare API Token: 长度 ${token_len}，结尾 ${token_tail}"
-    read -r -p "是否继续使用该 Token? [Y/n]: " use_previous
-    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
-      echo "已继续使用历史 Cloudflare API Token。"
-      return 0
-    fi
+  if confirm_reuse_config_value CF_API_TOKEN "Cloudflare API Token"; then
+    echo "已复用 node.config 中的 Cloudflare API Token。"
+    return 0
   fi
 
   read -r -p "Input Cloudflare multi-purpose API Token: " input_cf_token
@@ -1464,6 +1462,7 @@ require_root() {
 
 load_node_config() {
   local f="${NODE_CONFIG_FILE}"
+  NODE_CONFIG_LOADED_KEYS=""
   [[ -f "$f" ]] || return 1
   while IFS='=' read -r k v; do
     [[ -z "$k" || "$k" == "#"* ]] && continue
@@ -1472,10 +1471,31 @@ load_node_config() {
       UUID|CF_API_TOKEN|DOMAIN|NODE_PREFIX|ARGO_FIXED_DOMAIN|CDN_VMESS_CDN_DOMAIN|\
       HY2_PORT|SS2022_PORT|VMESS_PORT|TUIC_PORT|ANYTLS_PORT|VLESS_PORT|CDN_VMESS_PORT|CDN_VMESS_CLIENT_PORT|CDN_VMESS_ORIGIN_PORT|SUB_PORT)
         declare -g "${k}=${v}"
+        NODE_CONFIG_LOADED_KEYS="${NODE_CONFIG_LOADED_KEYS} ${k} "
         ;;
     esac
   done < "$f"
   return 0
+}
+
+node_config_has_key() {
+  local key="$1"
+  [[ " ${NODE_CONFIG_LOADED_KEYS:-} " == *" ${key} "* ]]
+}
+
+node_config_value() {
+  local key="$1"
+  node_config_has_key "$key" || return 1
+  printf '%s\n' "${!key:-}"
+}
+
+clear_unconfigured_node_config_values() {
+  local var
+  for var in UUID CF_API_TOKEN DOMAIN NODE_PREFIX ARGO_FIXED_DOMAIN CDN_VMESS_CDN_DOMAIN \
+             HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT \
+             CDN_VMESS_PORT CDN_VMESS_CLIENT_PORT CDN_VMESS_ORIGIN_PORT SUB_PORT; do
+    node_config_has_key "$var" || unset "$var"
+  done
 }
 
 save_node_config() {
@@ -1554,6 +1574,7 @@ config_value_label() {
 
 confirm_reuse_config_value() {
   local var="$1" label="$2" use_previous
+  node_config_has_key "$var" || return 1
   [[ -n "${!var:-}" ]] || return 1
   echo "检测到 node.config 中的${label}: $(config_value_label "$var")"
   read -r -p "是否复用该${label}? [Y/n]: " use_previous
@@ -2049,18 +2070,10 @@ read_common_uuid() {
 }
 
 prompt_common_uuid() {
-  local previous_uuid use_previous
-
-  previous_uuid="$(detect_existing_common_uuid 2>/dev/null || true)"
-  if [[ -n "$previous_uuid" ]]; then
-    echo "检测到之前节点使用的 UUID: $previous_uuid"
-    read -r -p "是否继续使用该 UUID? [Y/n]: " use_previous
-    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
-      UUID="$previous_uuid"
-      sync_common_uuid
-      echo "已继续使用历史 UUID: $UUID"
-      return 0
-    fi
+  if confirm_reuse_config_value UUID "通用 UUID"; then
+    sync_common_uuid
+    echo "已复用 node.config 中的 UUID: $UUID"
+    return 0
   fi
 
   read_common_uuid
@@ -2097,17 +2110,9 @@ read_subscription_port() {
 }
 
 prompt_subscription_port() {
-  local previous_port use_previous
-
-  previous_port="${SUB_PORT:-}"
-  if is_valid_port "$previous_port"; then
-    echo "检测到之前生成的订阅链接端口: $previous_port"
-    read -r -p "是否继续使用该端口? [Y/n]: " use_previous
-    if [[ ! "$use_previous" =~ ^[Nn]$ ]]; then
-      SUB_PORT="$previous_port"
-      echo "已继续使用订阅链接端口: $SUB_PORT"
-      return 0
-    fi
+  if is_valid_port "${SUB_PORT:-}" && confirm_reuse_config_value SUB_PORT "订阅链接端口"; then
+    echo "已复用 node.config 中的订阅链接端口: $SUB_PORT"
+    return 0
   fi
 
   read_subscription_port
@@ -5413,6 +5418,7 @@ do_one_click_all() {
   clear
   load_state >/dev/null 2>&1 || true
   load_node_config >/dev/null 2>&1 || true
+  clear_unconfigured_node_config_values
   cyan "================ 一键生成所有标准协议 ================"
   
   # 1. 引导获取 UUID
@@ -5805,7 +5811,7 @@ uninstall_all() {
 }
 
 do_one_click_all_with_cdn() {
-  local cf_proxy="${1:-1}" mode_title mode_note saved_cdn_vmess_port saved_cdn_vmess_client_port saved_cdn_vmess_origin_port
+  local cf_proxy="${1:-1}" mode_title mode_note saved_cdn_vmess_port saved_cdn_vmess_client_port saved_cdn_vmess_origin_port saved_argo_domain saved_cdn_domain
 
   if [[ "$cf_proxy" == "0" ]]; then
     mode_title="一键全协议 + 橙云 CDN VMess-WS 回源 443"
@@ -5818,9 +5824,12 @@ do_one_click_all_with_cdn() {
   clear
   load_state >/dev/null 2>&1 || true
   load_node_config >/dev/null 2>&1 || true
-  saved_cdn_vmess_port="${CDN_VMESS_PORT:-}"
-  saved_cdn_vmess_client_port="${CDN_VMESS_CLIENT_PORT:-}"
-  saved_cdn_vmess_origin_port="${CDN_VMESS_ORIGIN_PORT:-}"
+  clear_unconfigured_node_config_values
+  saved_cdn_vmess_port="$(node_config_value CDN_VMESS_PORT 2>/dev/null || true)"
+  saved_cdn_vmess_client_port="$(node_config_value CDN_VMESS_CLIENT_PORT 2>/dev/null || true)"
+  saved_cdn_vmess_origin_port="$(node_config_value CDN_VMESS_ORIGIN_PORT 2>/dev/null || true)"
+  saved_argo_domain="$(node_config_value ARGO_FIXED_DOMAIN 2>/dev/null || true)"
+  saved_cdn_domain="$(node_config_value CDN_VMESS_CDN_DOMAIN 2>/dev/null || true)"
   if [[ "$cf_proxy" == "0" ]]; then
     SUB_CF_PROXY="1"
   else
@@ -5849,10 +5858,8 @@ do_one_click_all_with_cdn() {
   fi
   if [[ "${CF_PROXY_REUSE_READY:-0}" == "1" && -n "${CF_API_TOKEN:-}" ]]; then
     _global_cf_token="$CF_API_TOKEN"
-  elif [[ -n "${CF_API_TOKEN:-}" ]]; then
-    read -r -p "Cloudflare API Token [empty = use current token]: " _global_cf_token
-    _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -n "$_global_cf_token" ]] && CF_API_TOKEN="$_global_cf_token"
+  elif confirm_reuse_config_value CF_API_TOKEN "Cloudflare API Token"; then
+    _global_cf_token="$CF_API_TOKEN"
   else
     read -r -p "Cloudflare API Token: " _global_cf_token
     _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -5936,7 +5943,7 @@ do_one_click_all_with_cdn() {
   echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
   echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
   local recommended_argo_domain
-  recommended_argo_domain="$(recommend_saved_or_cf_edge_domain "${ARGO_FIXED_DOMAIN:-}" argo "${DOMAIN:-}" 2>/dev/null || true)"
+  recommended_argo_domain="$(recommend_saved_or_cf_edge_domain "$saved_argo_domain" argo "${DOMAIN:-}" 2>/dev/null || true)"
   if [[ -n "$recommended_argo_domain" ]]; then
     read -r -p "请输入 Argo 隧道域名 [默认 ${recommended_argo_domain}，输入 0 跳过]: " argo_domain_input
     argo_domain_input="${argo_domain_input:-$recommended_argo_domain}"
@@ -5974,7 +5981,7 @@ do_one_click_all_with_cdn() {
   echo ""
   cyan "--- CDN+VMess+WS 配置 ---"
   local recommended_cdn_domain
-  recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "${CDN_VMESS_CDN_DOMAIN:-}" cdn "${DOMAIN:-}" 2>/dev/null || true)"
+  recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
   if [[ -n "$recommended_cdn_domain" ]]; then
     read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
     cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"

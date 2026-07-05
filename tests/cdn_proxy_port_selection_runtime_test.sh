@@ -11,7 +11,7 @@ port_in_use() { return 1; }
 CDN_VMESS_PORT="56000"
 configure_cdn_vmess_proxy_ports "" "" "" <<<"8443" >/dev/null
 [[ "$CDN_VMESS_CLIENT_PORT" == "8443" ]]
-[[ "$CDN_VMESS_PORT" == "56000" ]]
+[[ "$CDN_VMESS_PORT" == "57000" ]]
 [[ "$CDN_VMESS_ORIGIN_PORT" == "443" ]]
 [[ "$CDN_VMESS_CF_PROXY" == "1" ]]
 [[ "$CDN_VMESS_VIA_NGINX" == "1" ]]
