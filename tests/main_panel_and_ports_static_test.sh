@@ -26,6 +26,10 @@ require_pattern '1.Hysteria2 2.VMess 3.TUIC 4.AnyTLS 5.VLESS' \
   "one-click CDN flow must remove deprecated SS-2022 and separate CDN-VMess from the shared port prompt"
 require_pattern '全协议cf灰云+橙云+argo+cdn' \
   "main panel option 4 must use the requested label"
+require_pattern '  2) 基础协议(无cf,橙云+argo+cdn版)' \
+  "main panel must expose the no-CF basic protocol flow as option 2"
+require_pattern 'do_one_click_all_without_cf_cdn' \
+  "main panel option 2 must call the no-CF basic protocol flow"
 if grep -q '一键全协议+CDN 橙云回源443版' "$script"; then
   echo "menus must not show the old orange-cloud option label" >&2
   exit 1
@@ -49,3 +53,5 @@ require_absent_in_function 'do_one_click_all_with_cdn' 'SS-2022' \
   "one-click CDN flow must not mention SS-2022 in its port prompt"
 require_absent_in_function 'do_one_click_all_with_cdn' 'CDN-VMess=.*CDN_VMESS_PORT' \
   "one-click CDN flow must not allocate CDN-VMess in the shared direct port prompt"
+require_absent_in_function 'configure_domain_certificate_without_cf' 'cf_upsert_site_dns\|cf_find_zone_for_host\|CF_API_TOKEN' \
+  "no-CF domain certificate flow must not use Cloudflare API state"

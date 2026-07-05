@@ -1688,6 +1688,60 @@ configure_domain_certificate_with_config() {
   fi
 }
 
+configure_domain_certificate_without_cf() {
+  local input_domain vps_ip
+
+  if confirm_reuse_config_value DOMAIN "主域名"; then
+    input_domain="$DOMAIN"
+  else
+    read -r -p "请输入域名(留空使用 www.apple.com 自签证书): " input_domain
+    input_domain="$(normalize_argo_host "${input_domain:-}")"
+  fi
+
+  if [[ -z "$input_domain" ]]; then
+    DOMAIN=""
+    SITE_DOMAIN=""
+    SITE_ENABLED="0"
+    SNI_VAL="www.apple.com"
+    REALITY_SNI="$SNI_VAL"
+    SELF_SIGN_CERT="1"
+    USE_CF_ORIGIN_CA_CERT="0"
+    echo "未绑定域名，已为您生成 www.apple.com 自签证书。"
+    generate_self_signed_domain_cert "$SNI_VAL" || return 1
+    return 0
+  fi
+
+  DOMAIN="$input_domain"
+  SITE_DOMAIN="$DOMAIN"
+  SITE_ENABLED="1"
+  SNI_VAL="$DOMAIN"
+  REALITY_SNI="$DOMAIN"
+  SELF_SIGN_CERT="0"
+  USE_CF_ORIGIN_CA_CERT="0"
+
+  if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
+    echo "检测到服务器已存在匹配 ${DOMAIN} 的可用证书，将直接使用。"
+    save_state
+    install_mask_site_nginx || return 1
+    return 0
+  fi
+
+  yellow "将通过本机 nginx + Let's Encrypt 为 ${DOMAIN} 申请证书。"
+  yellow "请确认域名 A/AAAA 记录已指向本机，并且 TCP 80/443 已放行。"
+  vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
+  [[ -n "$vps_ip" ]] && SITE_VPS_IP="$vps_ip"
+  save_state
+  install_mask_site_nginx || return 1
+  if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
+    SELF_SIGN_CERT="0"
+    echo "证书已申请并同步到 ${SSL_DIR}。"
+    return 0
+  fi
+
+  red "证书申请后仍未检测到 ${DOMAIN} 的可用证书。"
+  return 1
+}
+
 apply_node_prefix() {
   local prefix="${1:-$(hostname)}"
   NODE_PREFIX="$prefix"
@@ -5811,9 +5865,14 @@ uninstall_all() {
 }
 
 do_one_click_all_with_cdn() {
-  local cf_proxy="${1:-1}" mode_title mode_note saved_cdn_vmess_port saved_cdn_vmess_client_port saved_cdn_vmess_origin_port saved_argo_domain saved_cdn_domain
+  local cf_proxy="${1:-1}" cf_api_mode="${2:-cf}" no_cf_mode="0" mode_title mode_note
+  local saved_cdn_vmess_port saved_cdn_vmess_client_port saved_cdn_vmess_origin_port saved_argo_domain saved_cdn_domain saved_cf_api_token
 
-  if [[ "$cf_proxy" == "0" ]]; then
+  if [[ "$cf_api_mode" == "no_cf" ]]; then
+    no_cf_mode="1"
+    mode_title="基础协议(无cf,橙云+argo+cdn版)"
+    mode_note="不读取 Cloudflare API Token，不自动配置 DNS/Origin Rules；有域名时申请真实证书，CDN/橙云相关记录需自行配置。"
+  elif [[ "$cf_proxy" == "0" ]]; then
     mode_title="一键全协议 + 橙云 CDN VMess-WS 回源 443"
     mode_note="CDN-VMess 域名将设置为 Cloudflare 代理/橙云；客户端端口可用 443/2053/2083/2087/2096/8443，源站统一回源 443。"
   else
@@ -5830,6 +5889,13 @@ do_one_click_all_with_cdn() {
   saved_cdn_vmess_origin_port="$(node_config_value CDN_VMESS_ORIGIN_PORT 2>/dev/null || true)"
   saved_argo_domain="$(node_config_value ARGO_FIXED_DOMAIN 2>/dev/null || true)"
   saved_cdn_domain="$(node_config_value CDN_VMESS_CDN_DOMAIN 2>/dev/null || true)"
+  saved_cf_api_token="${CF_API_TOKEN:-}"
+  if [[ "$no_cf_mode" == "1" ]]; then
+    CF_API_TOKEN=""
+    ARGO_CF_ZONE_ID=""
+    ARGO_CF_ZONE_NAME=""
+    ARGO_CF_ACCOUNT_ID=""
+  fi
   if [[ "$cf_proxy" == "0" ]]; then
     SUB_CF_PROXY="1"
   else
@@ -5848,40 +5914,45 @@ do_one_click_all_with_cdn() {
     prompt_common_uuid
   fi
 
-  # ===== 第2步: 全局 CF Token =====
+  # ===== 第2步: 全局 CF Token / 域名证书 =====
   echo ""
-  cyan "--- Cloudflare API Token (全局) ---"
-  if [[ "$cf_proxy" == "0" ]]; then
-    echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的橙云 DNS/Origin Rules"
+  if [[ "$no_cf_mode" == "1" ]]; then
+    cyan "--- 域名和证书 (无 CF API) ---"
+    configure_domain_certificate_without_cf || return 1
   else
-    echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS/Origin Rules"
-  fi
-  if [[ "${CF_PROXY_REUSE_READY:-0}" == "1" && -n "${CF_API_TOKEN:-}" ]]; then
-    _global_cf_token="$CF_API_TOKEN"
-  elif confirm_reuse_config_value CF_API_TOKEN "Cloudflare API Token"; then
-    _global_cf_token="$CF_API_TOKEN"
-  else
-    read -r -p "Cloudflare API Token: " _global_cf_token
-    _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    if [[ -z "$_global_cf_token" ]]; then
-      red "Cloudflare API Token is required."
-      return 1
+    cyan "--- Cloudflare API Token (全局) ---"
+    if [[ "$cf_proxy" == "0" ]]; then
+      echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的橙云 DNS/Origin Rules"
+    else
+      echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS/Origin Rules"
     fi
-    CF_API_TOKEN="$_global_cf_token"
-  fi
-  _global_cf_token="$CF_API_TOKEN"
-  local token_len="${#_global_cf_token}"
-  local token_tail="$_global_cf_token"
-  if (( token_len > 6 )); then
-    token_tail="${_global_cf_token: -6}"
-  fi
-  echo "Token 已读取: 长度 ${token_len}，结尾 ${token_tail}"
+    if [[ "${CF_PROXY_REUSE_READY:-0}" == "1" && -n "${CF_API_TOKEN:-}" ]]; then
+      _global_cf_token="$CF_API_TOKEN"
+    elif confirm_reuse_config_value CF_API_TOKEN "Cloudflare API Token"; then
+      _global_cf_token="$CF_API_TOKEN"
+    else
+      read -r -p "Cloudflare API Token: " _global_cf_token
+      _global_cf_token="$(printf '%s' "$_global_cf_token" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ -z "$_global_cf_token" ]]; then
+        red "Cloudflare API Token is required."
+        return 1
+      fi
+      CF_API_TOKEN="$_global_cf_token"
+    fi
+    _global_cf_token="$CF_API_TOKEN"
+    local token_len="${#_global_cf_token}"
+    local token_tail="$_global_cf_token"
+    if (( token_len > 6 )); then
+      token_tail="${_global_cf_token: -6}"
+    fi
+    echo "Token 已读取: 长度 ${token_len}，结尾 ${token_tail}"
 
-  # ===== 第3步: 主域名和证书 =====
-  echo ""
-  configure_domain_certificate_with_config || return 1
-  if [[ -n "${CF_API_TOKEN:-}" && -n "${DOMAIN:-}" && -z "${ARGO_CF_ZONE_NAME:-}" ]]; then
-    cf_find_zone_for_host "$DOMAIN" >/dev/null 2>&1 || true
+    # ===== 第3步: 主域名和证书 =====
+    echo ""
+    configure_domain_certificate_with_config || return 1
+    if [[ -n "${CF_API_TOKEN:-}" && -n "${DOMAIN:-}" && -z "${ARGO_CF_ZONE_NAME:-}" ]]; then
+      cf_find_zone_for_host "$DOMAIN" >/dev/null 2>&1 || true
+    fi
   fi
 
   # ===== 第4步: 端口分配（5个直连协议: HY2/VMess/TUIC/AnyTLS/VLESS；CDN-VMess 后续单独配置） =====
@@ -5927,7 +5998,7 @@ do_one_click_all_with_cdn() {
     fi
     _used_ports+=("$_port_val")
   done
-  if [[ "$cf_proxy" == "0" ]]; then
+  if [[ "$cf_proxy" == "0" && ( "$no_cf_mode" != "1" || -n "${DOMAIN:-}" ) ]]; then
     echo ""
     cyan "--- CDN+VMess+WS 端口配置 ---"
     configure_cdn_vmess_proxy_ports "$saved_cdn_vmess_client_port" "$saved_cdn_vmess_origin_port" "$saved_cdn_vmess_port" || return 1
@@ -5939,66 +6010,96 @@ do_one_click_all_with_cdn() {
 
   # ===== 第6步: Argo 隧道域名 =====
   echo ""
-  cyan "--- Argo 隧道配置 ---"
-  echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
-  echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
-  local recommended_argo_domain
-  recommended_argo_domain="$(recommend_saved_or_cf_edge_domain "$saved_argo_domain" argo "${DOMAIN:-}" 2>/dev/null || true)"
-  if [[ -n "$recommended_argo_domain" ]]; then
-    read -r -p "请输入 Argo 隧道域名 [默认 ${recommended_argo_domain}，输入 0 跳过]: " argo_domain_input
-    argo_domain_input="${argo_domain_input:-$recommended_argo_domain}"
-  else
-    read -r -p "请输入 Argo 隧道域名 (如 tunnel.example.com): " argo_domain_input
-  fi
-  argo_domain_input="$(printf '%s' "${argo_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
-
-  if [[ "$argo_domain_input" == "0" ]]; then
-    yellow "跳过 Argo 隧道。"
-    ARGO_ENABLED="0"
-  elif [[ -n "$argo_domain_input" ]]; then
-    ARGO_FIXED_DOMAIN="$argo_domain_input"
-    ARGO_TUNNEL_MODE="named"
-    ARGO_DOMAIN="$ARGO_FIXED_DOMAIN"
-    pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
-    echo "隧道域名: ${ARGO_FIXED_DOMAIN}  本地端口: ${ARGO_LOCAL_PORT}"
-    if ! cf_configure_named_tunnel; then
-      red "Argo Named Tunnel 配置失败，将跳过 Argo。"
-      ARGO_ENABLED="0"
-    else
-      ARGO_ENABLED="1"
-    fi
-  else
-    yellow "未输入域名，使用临时隧道。"
+  if [[ "$no_cf_mode" == "1" ]]; then
+    cyan "--- Argo 临时隧道配置 (无 CF API) ---"
+    echo "无 CF 模式不创建 Named Tunnel，自动使用 trycloudflare.com 临时隧道。"
     ARGO_TUNNEL_MODE="quick"
     ARGO_FIXED_DOMAIN=""
     ARGO_TUNNEL_TOKEN=""
     ARGO_DOMAIN=""
     pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
     ARGO_ENABLED="1"
+  else
+    cyan "--- Argo 隧道配置 ---"
+    echo "CF Token 已就绪，输入隧道域名即可自动配置 Named Tunnel。"
+    echo "留空则使用临时隧道(trycloudflare.com)，输入 0 跳过 Argo。"
+    local recommended_argo_domain
+    recommended_argo_domain="$(recommend_saved_or_cf_edge_domain "$saved_argo_domain" argo "${DOMAIN:-}" 2>/dev/null || true)"
+    if [[ -n "$recommended_argo_domain" ]]; then
+      read -r -p "请输入 Argo 隧道域名 [默认 ${recommended_argo_domain}，输入 0 跳过]: " argo_domain_input
+      argo_domain_input="${argo_domain_input:-$recommended_argo_domain}"
+    else
+      read -r -p "请输入 Argo 隧道域名 (如 tunnel.example.com): " argo_domain_input
+    fi
+    argo_domain_input="$(printf '%s' "${argo_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+
+    if [[ "$argo_domain_input" == "0" ]]; then
+      yellow "跳过 Argo 隧道。"
+      ARGO_ENABLED="0"
+    elif [[ -n "$argo_domain_input" ]]; then
+      ARGO_FIXED_DOMAIN="$argo_domain_input"
+      ARGO_TUNNEL_MODE="named"
+      ARGO_DOMAIN="$ARGO_FIXED_DOMAIN"
+      pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
+      echo "隧道域名: ${ARGO_FIXED_DOMAIN}  本地端口: ${ARGO_LOCAL_PORT}"
+      if ! cf_configure_named_tunnel; then
+        red "Argo Named Tunnel 配置失败，将跳过 Argo。"
+        ARGO_ENABLED="0"
+      else
+        ARGO_ENABLED="1"
+      fi
+    else
+      yellow "未输入域名，使用临时隧道。"
+      ARGO_TUNNEL_MODE="quick"
+      ARGO_FIXED_DOMAIN=""
+      ARGO_TUNNEL_TOKEN=""
+      ARGO_DOMAIN=""
+      pick_argo_local_port || ARGO_LOCAL_PORT="$(shuf -i 50000-60000 -n 1)"
+      ARGO_ENABLED="1"
+    fi
   fi
 
   # ===== 第7步: CDN 加速域名 =====
   echo ""
   cyan "--- CDN+VMess+WS 配置 ---"
-  local recommended_cdn_domain
-  recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
-  if [[ -n "$recommended_cdn_domain" ]]; then
-    read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
-    cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
+  local recommended_cdn_domain cdn_domain_input cdn_requested="1"
+  if [[ "$no_cf_mode" == "1" && -z "${DOMAIN:-}" ]]; then
+    yellow "未输入主域名，跳过 CDN+VMess+WS；直连协议和 Argo 临时隧道仍会生成。"
+    cdn_requested="0"
   else
-    read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
-  fi
-  cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
-  if [[ -z "$cdn_domain_input" ]]; then
-    red "CDN 域名不能为空。"
-    return 1
+    recommended_cdn_domain="$(recommend_saved_or_cf_edge_domain "$saved_cdn_domain" cdn "${DOMAIN:-}" 2>/dev/null || true)"
+    if [[ "$no_cf_mode" == "1" ]]; then
+      echo "无 CF 模式只生成节点和 nginx 回源配置，不会创建 DNS 或 Origin Rules。"
+      echo "输入 0 可跳过 CDN+VMess+WS。"
+    fi
+    if [[ -n "$recommended_cdn_domain" ]]; then
+      read -r -p "请输入 CDN 加速域名 [默认 ${recommended_cdn_domain}]: " cdn_domain_input
+      cdn_domain_input="${cdn_domain_input:-$recommended_cdn_domain}"
+    else
+      read -r -p "请输入 CDN 加速域名 (如 cdn.example.com): " cdn_domain_input
+    fi
+    cdn_domain_input="$(printf '%s' "${cdn_domain_input:-}" | sed -E 's#^https?://##; s#/.*$##; s/[[:space:]]//g')"
+    if [[ "$cdn_domain_input" == "0" ]]; then
+      yellow "跳过 CDN+VMess+WS。"
+      cdn_requested="0"
+      cdn_domain_input=""
+    elif [[ -z "$cdn_domain_input" ]]; then
+      red "CDN 域名不能为空。"
+      return 1
+    fi
   fi
 
   echo ""
   local cdn_need_origin_rule="0"
-  if [[ "$cf_proxy" == "0" ]]; then
+  if [[ "$cdn_requested" != "1" ]]; then
+    CDN_VMESS_ENABLED="0"
+  elif [[ "$cf_proxy" == "0" ]]; then
     cdn_need_origin_rule="$(cdn_vmess_origin_rule_flag)"
-    echo "橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CF -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
+    if [[ "$no_cf_mode" == "1" ]]; then
+      echo "手动橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CDN -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
+    else
+      echo "橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CF -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
+    fi
   else
     echo "CDN 端口模式:"
     echo "  A) CF 标准 HTTP 端口 (无需 Origin Rules)"
@@ -6051,7 +6152,7 @@ do_one_click_all_with_cdn() {
   SS2022_ENABLED="0"
   VMESS_ENABLED="1"
   TUIC_ENABLED="1"
-  CDN_VMESS_ENABLED="1"
+  [[ "${CDN_VMESS_ENABLED:-1}" == "0" ]] || CDN_VMESS_ENABLED="1"
 
   HY2_TLS_SNI="$SNI_VAL"
   TUIC_TLS_SNI="$SNI_VAL"
@@ -6082,15 +6183,20 @@ do_one_click_all_with_cdn() {
   HY2_SERVER_ADDR="${vps_ip}"
   TUIC_SERVER_ADDR="${vps_ip}"
   ANYTLS_SERVER_ADDR="${vps_ip}"
-  CDN_VMESS_UUID="${UUID}"
-  CDN_VMESS_CDN_DOMAIN="$cdn_domain_input"
-  CDN_VMESS_SERVER_ADDR="${vps_ip}"
-  CDN_VMESS_ORIGIN_PORT="${CDN_VMESS_ORIGIN_PORT:-$CDN_VMESS_PORT}"
-  if [[ "$cf_proxy" == "0" ]]; then
-    CDN_VMESS_CF_PROXY="1"
-    CDN_VMESS_VIA_NGINX="1"
+  if [[ "${CDN_VMESS_ENABLED:-0}" == "1" ]]; then
+    CDN_VMESS_UUID="${UUID}"
+    CDN_VMESS_CDN_DOMAIN="$cdn_domain_input"
+    CDN_VMESS_SERVER_ADDR="${vps_ip}"
+    CDN_VMESS_ORIGIN_PORT="${CDN_VMESS_ORIGIN_PORT:-$CDN_VMESS_PORT}"
+    if [[ "$cf_proxy" == "0" ]]; then
+      CDN_VMESS_CF_PROXY="1"
+      CDN_VMESS_VIA_NGINX="1"
+    else
+      CDN_VMESS_CF_PROXY="$cf_proxy"
+    fi
   else
-    CDN_VMESS_CF_PROXY="$cf_proxy"
+    CDN_VMESS_CDN_DOMAIN=""
+    CDN_VMESS_VIA_NGINX="0"
   fi
 
   # 生成 VLESS Reality 密钥对
@@ -6102,14 +6208,23 @@ do_one_click_all_with_cdn() {
 
   # CDN DNS + Origin Rules 配置
   echo ""
-  if [[ "$CDN_VMESS_CF_PROXY" == "1" ]]; then
-    echo "正在配置 CDN+VMess+WS 的 Cloudflare 黄云 DNS..."
+  if [[ "${CDN_VMESS_ENABLED:-0}" == "1" ]]; then
+    if [[ "$no_cf_mode" == "1" ]]; then
+      yellow "无 CF 模式：跳过 CDN DNS/Origin Rules 自动配置。"
+      yellow "请自行将 ${CDN_VMESS_CDN_DOMAIN} 指向本机，并按需开启橙云；回源端口使用 $(cdn_vmess_origin_port)，客户端端口使用 $(cdn_vmess_client_port)。"
+    else
+      if [[ "$CDN_VMESS_CF_PROXY" == "1" ]]; then
+        echo "正在配置 CDN+VMess+WS 的 Cloudflare 黄云 DNS..."
+      else
+        echo "正在配置 CDN+VMess+WS 的 Cloudflare 灰云 DNS..."
+      fi
+      if ! cf_configure_cdn_vmess "$cdn_domain_input" "$(cdn_vmess_origin_port)" "$vps_ip" "$(cdn_vmess_origin_rule_flag)" "$CDN_VMESS_CF_PROXY"; then
+        yellow "CDN-VMess DNS 配置失败，跳过 CDN+VMess+WS 节点。"
+        CDN_VMESS_ENABLED="0"
+      fi
+    fi
   else
-    echo "正在配置 CDN+VMess+WS 的 Cloudflare 灰云 DNS..."
-  fi
-  if ! cf_configure_cdn_vmess "$cdn_domain_input" "$(cdn_vmess_origin_port)" "$vps_ip" "$(cdn_vmess_origin_rule_flag)" "$CDN_VMESS_CF_PROXY"; then
-    yellow "CDN-VMess DNS 配置失败，跳过 CDN+VMess+WS 节点。"
-    CDN_VMESS_ENABLED="0"
+    yellow "已跳过 CDN+VMess+WS。"
   fi
 
   # 写入 sing-box 配置（包含所有协议 + CDN VMess inbound）
@@ -6176,6 +6291,13 @@ do_one_click_all_with_cdn() {
   install_subscription_service || true
 
   save_state
+  if [[ "$no_cf_mode" == "1" ]]; then
+    if [[ -n "$saved_cf_api_token" ]]; then
+      CF_API_TOKEN="$saved_cf_api_token"
+    else
+      unset CF_API_TOKEN
+    fi
+  fi
   save_node_config
 
   green "${mode_title} 安装完成！"
@@ -6187,6 +6309,10 @@ do_one_click_all_with_cdn() {
 
 do_one_click_all_with_direct_cdn() {
   do_one_click_all_with_cdn 0
+}
+
+do_one_click_all_without_cf_cdn() {
+  do_one_click_all_with_cdn 0 no_cf
 }
 
 do_one_click_all_with_cf_cdn() {
@@ -6268,6 +6394,7 @@ main_menu() {
     print_sing_box_panel_status
     echo ""
     echo "  1  安装 sing-box"
+    echo "  2) 基础协议(无cf,橙云+argo+cdn版)"
     echo "  3) 创建代理节点"
     echo "  4) 全协议cf灰云+橙云+argo+cdn"
     echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
@@ -6294,8 +6421,8 @@ main_menu() {
         read -r
         ;;
       2)
-        if ! install_mask_site_nginx; then
-          red "站点和 nginx 代理配置失败。"
+        if ! do_one_click_all_without_cf_cdn; then
+          red "基础协议(无cf,橙云+argo+cdn版)安装失败。"
         fi
         echo "按回车键返回主菜单..."
         read -r

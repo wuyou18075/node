@@ -87,3 +87,18 @@ prompt_subscription_port <<< "" > "$sub_port_output_file" 2>&1
 sub_port_config_output="$(<"$sub_port_output_file")"
 [[ "$sub_port_config_output" == *"检测到 node.config 中的订阅链接端口"* ]]
 [[ "$SUB_PORT" == "59100" ]]
+
+NODE_CONFIG_LOADED_KEYS=""
+unset DOMAIN SITE_DOMAIN SITE_ENABLED SNI_VAL REALITY_SNI SELF_SIGN_CERT USE_CF_ORIGIN_CA_CERT generated_cert_domain
+generate_self_signed_domain_cert() {
+  generated_cert_domain="$1"
+}
+configure_domain_certificate_without_cf <<< "" >/dev/null
+[[ -z "${DOMAIN:-}" ]]
+[[ -z "${SITE_DOMAIN:-}" ]]
+[[ "${SITE_ENABLED:-}" == "0" ]]
+[[ "$SNI_VAL" == "www.apple.com" ]]
+[[ "$REALITY_SNI" == "www.apple.com" ]]
+[[ "$SELF_SIGN_CERT" == "1" ]]
+[[ "$USE_CF_ORIGIN_CA_CERT" == "0" ]]
+[[ "$generated_cert_domain" == "www.apple.com" ]]
