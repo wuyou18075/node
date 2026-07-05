@@ -13,7 +13,9 @@ require_pattern() {
 
 require_function_pattern() {
   local function_name="$1" pattern="$2" message="$3"
-  if ! awk "/^${function_name}\\(\\)/,/^}/ { print }" "$script" | grep -q "$pattern"; then
+  local function_body
+  function_body="$(awk "/^${function_name}\\(\\)/,/^}/ { print }" "$script")"
+  if ! grep -q "$pattern" <<<"$function_body"; then
     echo "$message" >&2
     exit 1
   fi

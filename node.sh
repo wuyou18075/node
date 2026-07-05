@@ -1008,6 +1008,8 @@ cdn_vmess_uses_cf_proxy() {
 cdn_vmess_client_port() {
   if ! cdn_vmess_uses_cf_proxy; then
     printf '%s\n' "$CDN_VMESS_PORT"
+  elif [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" && -n "${CDN_VMESS_CLIENT_PORT:-}" ]]; then
+    printf '%s\n' "$CDN_VMESS_CLIENT_PORT"
   elif cf_is_standard_http_port "$CDN_VMESS_PORT"; then
     printf '%s\n' "$CDN_VMESS_PORT"
   else
@@ -1015,17 +1017,79 @@ cdn_vmess_client_port() {
   fi
 }
 
+cdn_vmess_origin_port() {
+  printf '%s\n' "${CDN_VMESS_ORIGIN_PORT:-${CDN_VMESS_PORT:-443}}"
+}
+
+cdn_vmess_origin_rule_flag() {
+  if cdn_vmess_uses_cf_proxy && { [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" ]] || [[ "$(cdn_vmess_origin_port)" != "$(cdn_vmess_client_port)" ]]; }; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
 cdn_vmess_client_tls_enabled() {
-  if cdn_vmess_uses_cf_proxy && ! cf_is_standard_http_port "$CDN_VMESS_PORT"; then
+  local client_port
+  client_port="$(cdn_vmess_client_port)"
+  if cdn_vmess_uses_cf_proxy && ! cf_is_standard_http_port "$client_port"; then
     return 0
   fi
   return 1
 }
 
+configure_cdn_vmess_proxy_ports() {
+  local saved_client="${1:-}" saved_origin="${2:-}" saved_local="${3:-}" generated_local input reuse
+
+  generated_local="${CDN_VMESS_PORT:-}"
+  if [[ -n "$saved_client$saved_origin$saved_local" ]]; then
+    echo "检测到之前的 CDN 端口配置: 客户端端口 ${saved_client:-443}, 回源端口 ${saved_origin:-443}, 本地入站 ${saved_local:-${generated_local:-未设置}}"
+    read -r -p "是否复用之前的 CDN 端口配置? [Y/n]: " reuse
+    if [[ ! "$reuse" =~ ^[Nn]$ ]]; then
+      CDN_VMESS_CLIENT_PORT="${saved_client:-443}"
+      CDN_VMESS_ORIGIN_PORT="${saved_origin:-443}"
+      CDN_VMESS_PORT="${saved_local:-${generated_local:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}}"
+      CDN_VMESS_CF_PROXY="1"
+      CDN_VMESS_VIA_NGINX="1"
+      return 0
+    fi
+  fi
+
+  read -r -p "指定端口443/2053/2083/2087/2096/8443/自定义回源，回车随机50000-60000: " input
+  input="$(printf '%s' "${input:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  if [[ -z "$input" ]]; then
+    CDN_VMESS_CLIENT_PORT="443"
+    CDN_VMESS_PORT="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+    echo "已自动生成 CDN 本地回源端口: ${CDN_VMESS_PORT}"
+  elif ! is_valid_port "$input"; then
+    red "端口无效。"
+    return 1
+  elif cf_is_standard_https_port "$input"; then
+    CDN_VMESS_CLIENT_PORT="$input"
+    CDN_VMESS_PORT="${generated_local:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    echo "CDN 客户端端口: ${CDN_VMESS_CLIENT_PORT}，源站统一回源 443，本地入站端口: ${CDN_VMESS_PORT}"
+  else
+    if port_in_use "$input"; then
+      red "端口 ${input} 已被占用，请换一个自定义回源端口。"
+      return 1
+    fi
+    CDN_VMESS_CLIENT_PORT="443"
+    CDN_VMESS_PORT="$input"
+    echo "CDN 客户端端口: 443，自定义本地回源端口: ${CDN_VMESS_PORT}"
+  fi
+
+  CDN_VMESS_ORIGIN_PORT="443"
+  CDN_VMESS_CF_PROXY="1"
+  CDN_VMESS_VIA_NGINX="1"
+}
+
 cf_configure_cdn_vmess() {
   local cdn_domain="$1" origin_port="$2" vps_ip="$3" need_origin_rule="$4" proxied="${5:-1}"
+  local client_port
 
   ensure_packages_for_commands curl jq || return 1
+  client_port="$(cdn_vmess_client_port)"
 
   yellow "正在查找 Cloudflare Zone: ${cdn_domain}"
   cf_find_zone_for_host "$cdn_domain" || return 1
@@ -1050,12 +1114,12 @@ cf_configure_cdn_vmess() {
     green "Cloudflare CDN VMess 配置完成。"
     echo "域名: ${cdn_domain} (橙云代理已开启)"
     echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
-    echo "Origin Rule: 客户端 -> ${cdn_domain}:443 -> CF CDN -> VPS:${origin_port}"
+    echo "Origin Rule: 客户端 -> ${cdn_domain}:${client_port} -> CF CDN -> VPS:${origin_port}"
   else
     green "Cloudflare CDN VMess 配置完成。"
     echo "域名: ${cdn_domain} (橙云代理已开启)"
     echo "Zone: ${CDN_VMESS_CF_ZONE_NAME}"
-    echo "直连 CF 标准端口: 客户端 -> ${cdn_domain}:${origin_port} -> CF CDN -> VPS:${origin_port}"
+    echo "直连 CF 标准端口: 客户端 -> ${cdn_domain}:${client_port} -> CF CDN -> VPS:${origin_port}"
   fi
 }
 
@@ -1369,7 +1433,7 @@ load_node_config() {
     [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case "$k" in
       UUID|CF_API_TOKEN|DOMAIN|NODE_PREFIX|ARGO_FIXED_DOMAIN|CDN_VMESS_CDN_DOMAIN|\
-      HY2_PORT|SS2022_PORT|VMESS_PORT|TUIC_PORT|ANYTLS_PORT|VLESS_PORT|CDN_VMESS_PORT|SUB_PORT)
+      HY2_PORT|SS2022_PORT|VMESS_PORT|TUIC_PORT|ANYTLS_PORT|VLESS_PORT|CDN_VMESS_PORT|CDN_VMESS_CLIENT_PORT|CDN_VMESS_ORIGIN_PORT|SUB_PORT)
         declare -g "${k}=${v}"
         ;;
     esac
@@ -1385,7 +1449,7 @@ save_node_config() {
   printf '# AGSB reusable input config\n' >> "$tmp"
   printf '# This file is kept when menu 99 uninstalls generated services and data.\n' >> "$tmp"
   for var in UUID CF_API_TOKEN DOMAIN NODE_PREFIX ARGO_FIXED_DOMAIN CDN_VMESS_CDN_DOMAIN \
-             HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT SUB_PORT; do
+             HY2_PORT SS2022_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT CDN_VMESS_PORT CDN_VMESS_CLIENT_PORT CDN_VMESS_ORIGIN_PORT SUB_PORT; do
     val="${!var:-}"
     [[ -n "$val" ]] && printf '%s=%s\n' "$var" "$val" >> "$tmp"
   done
@@ -1656,7 +1720,7 @@ save_state() {
              DOMAIN SNI_VAL SELF_SIGN_CERT CF_API_TOKEN \
              NODE_NAME_VLESS NODE_NAME_HY2 NODE_NAME_SS2022 NODE_NAME_VMESS NODE_NAME_TUIC NODE_NAME_ARGO NODE_NAME_ANYTLS \
              VLESS_ENABLED HY2_ENABLED SS2022_ENABLED VMESS_ENABLED TUIC_ENABLED ARGO_ENABLED ANYTLS_ENABLED \
-             CDN_VMESS_PORT CDN_VMESS_UUID CDN_VMESS_WS_PATH CDN_VMESS_CDN_DOMAIN CDN_VMESS_ORIGIN_PORT CDN_VMESS_SERVER_ADDR CDN_VMESS_ENABLED CDN_VMESS_CF_PROXY CDN_VMESS_CF_ZONE_ID CDN_VMESS_CF_ZONE_NAME NODE_NAME_CDN_VMESS \
+             CDN_VMESS_PORT CDN_VMESS_CLIENT_PORT CDN_VMESS_UUID CDN_VMESS_WS_PATH CDN_VMESS_CDN_DOMAIN CDN_VMESS_ORIGIN_PORT CDN_VMESS_SERVER_ADDR CDN_VMESS_ENABLED CDN_VMESS_CF_PROXY CDN_VMESS_VIA_NGINX CDN_VMESS_CF_ZONE_ID CDN_VMESS_CF_ZONE_NAME NODE_NAME_CDN_VMESS \
              ARGO_TUNNEL_MODE; do
     val="${!var:-}"
     [[ -n "$val" ]] && printf '%s=%s\n' "$var" "$val" >> "$tmp"
@@ -2052,7 +2116,7 @@ write_sing_box_service() {
 }
 
 write_sing_box_config() {
-  local public_listen tmp_cfg vmess_listen
+  local public_listen tmp_cfg vmess_listen cdn_vmess_listen
 
   ensure_packages_for_commands jq || return 1
   install_sing_box || { red "sing-box 核心安装失败，无法继续！"; return 1; }
@@ -2070,6 +2134,11 @@ write_sing_box_config() {
     vmess_listen="127.0.0.1"
   else
     vmess_listen="$public_listen"
+  fi
+  if [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" ]]; then
+    cdn_vmess_listen="127.0.0.1"
+  else
+    cdn_vmess_listen="$public_listen"
   fi
   mkdir -p "$SING_BOX_DIR"
   ensure_node_info_dir
@@ -2131,6 +2200,7 @@ write_sing_box_config() {
     --arg cdn_vmess_port "${CDN_VMESS_PORT:-}" \
     --arg cdn_vmess_uuid "${CDN_VMESS_UUID:-}" \
     --arg cdn_vmess_ws_path "${CDN_VMESS_WS_PATH:-}" \
+    --arg cdn_vmess_listen "$cdn_vmess_listen" \
     --arg public_listen "$public_listen" '
 [
   (if $uuid != "" and $private_key != "" and $public_key != "" and $short_id != "" then
@@ -2300,7 +2370,7 @@ write_sing_box_config() {
     {
       "type": "vmess",
       "tag": "cdn-vmess-ws-in",
-      "listen": $public_listen,
+      "listen": $cdn_vmess_listen,
       "listen_port": ($cdn_vmess_port | tonumber),
       "users": [
         {
@@ -2836,7 +2906,7 @@ show_node_info() {
       sed -n '1p' "$CDN_VMESS_SUB_RAW_TXT"
     fi
     if cdn_vmess_uses_cf_proxy; then
-      echo "  (客户端 → ${CDN_VMESS_CDN_DOMAIN}:$(cdn_vmess_client_port) → CF CDN → VPS:${CDN_VMESS_PORT})"
+      echo "  (客户端 → ${CDN_VMESS_CDN_DOMAIN}:$(cdn_vmess_client_port) → CF CDN → VPS:$(cdn_vmess_origin_port) → 本机:${CDN_VMESS_PORT})"
     else
       echo "  (客户端 → ${CDN_VMESS_CDN_DOMAIN}:$(cdn_vmess_client_port) → VPS:${CDN_VMESS_PORT}，灰云直连)"
     fi
@@ -3800,12 +3870,17 @@ cdn_vmess_uri() {
 }
 
 build_cdn_vmess_share_files() {
-  local uri client_port mode_note
+  local uri client_port origin_port mode_note
   ensure_node_info_dir
   uri="$(cdn_vmess_uri)"
   client_port="$(cdn_vmess_client_port)"
+  origin_port="$(cdn_vmess_origin_port)"
   if cdn_vmess_uses_cf_proxy; then
-    mode_note="客户端连接 ${CDN_VMESS_CDN_DOMAIN}:${client_port}，经 CF CDN 加速回源至 VPS:${CDN_VMESS_PORT}"
+    if [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" ]]; then
+      mode_note="客户端连接 ${CDN_VMESS_CDN_DOMAIN}:${client_port}，经 CF CDN 回源 VPS:${origin_port}，nginx 按 ${CDN_VMESS_WS_PATH} 转发到本机 ${CDN_VMESS_PORT}"
+    else
+      mode_note="客户端连接 ${CDN_VMESS_CDN_DOMAIN}:${client_port}，经 CF CDN 加速回源至 VPS:${origin_port}"
+    fi
   else
     mode_note="客户端直连 ${CDN_VMESS_CDN_DOMAIN}:${client_port}，DNS 为灰云/DNS-only，VPS 需放行 TCP ${CDN_VMESS_PORT}"
   fi
@@ -3814,8 +3889,10 @@ build_cdn_vmess_share_files() {
     "type: CDN+VMess+WS" \
     "cdnDomain: ${CDN_VMESS_CDN_DOMAIN}" \
     "clientPort: ${client_port}" \
-    "originPort: ${CDN_VMESS_PORT} (VPS)" \
+    "originPort: ${origin_port} (VPS)" \
+    "localPort: ${CDN_VMESS_PORT} (sing-box)" \
     "cloudflareProxy: ${CDN_VMESS_CF_PROXY:-1}" \
+    "viaNginx: ${CDN_VMESS_VIA_NGINX:-0}" \
     "uuid: ${CDN_VMESS_UUID}" \
     "wsPath: ${CDN_VMESS_WS_PATH}" \
     "cfZone: ${CDN_VMESS_CF_ZONE_NAME:-unknown}" \
@@ -3834,6 +3911,9 @@ build_cdn_vmess_share_files() {
 
 install_cdn_vmess_core() {
   local cdn_domain api_token input_port vps_ip port_mode need_origin_rule
+
+  CDN_VMESS_CLIENT_PORT=""
+  CDN_VMESS_VIA_NGINX="0"
 
   echo ""
   cyan "=== CDN+VMess+WS 节点安装 ==="
@@ -5652,11 +5732,11 @@ uninstall_all() {
 }
 
 do_one_click_all_with_cdn() {
-  local cf_proxy="${1:-1}" mode_title mode_note
+  local cf_proxy="${1:-1}" mode_title mode_note saved_cdn_vmess_port saved_cdn_vmess_client_port saved_cdn_vmess_origin_port
 
   if [[ "$cf_proxy" == "0" ]]; then
-    mode_title="一键全协议 + 灰云直连 VMess-WS"
-    mode_note="CDN-VMess 域名将设置为 DNS-only/灰云，客户端直连自定义端口，不受 Cloudflare 标准端口限制。"
+    mode_title="一键全协议 + 橙云 CDN VMess-WS 回源 443"
+    mode_note="CDN-VMess 域名将设置为 Cloudflare 代理/橙云；客户端端口可用 443/2053/2083/2087/2096/8443，源站统一回源 443。"
   else
     mode_title="一键全协议 + 黄云 CDN VMess-WS"
     mode_note="CDN-VMess 域名将设置为 Cloudflare 代理/黄云，客户端使用 Cloudflare 边缘证书和支持的端口规则。"
@@ -5665,7 +5745,16 @@ do_one_click_all_with_cdn() {
   clear
   load_state >/dev/null 2>&1 || true
   load_node_config >/dev/null 2>&1 || true
-  SUB_CF_PROXY="$cf_proxy"
+  saved_cdn_vmess_port="${CDN_VMESS_PORT:-}"
+  saved_cdn_vmess_client_port="${CDN_VMESS_CLIENT_PORT:-}"
+  saved_cdn_vmess_origin_port="${CDN_VMESS_ORIGIN_PORT:-}"
+  if [[ "$cf_proxy" == "0" ]]; then
+    SUB_CF_PROXY="1"
+  else
+    SUB_CF_PROXY="$cf_proxy"
+    CDN_VMESS_CLIENT_PORT=""
+    CDN_VMESS_VIA_NGINX="0"
+  fi
   cyan "================ ${mode_title} ================"
   echo "$mode_note"
 
@@ -5681,7 +5770,7 @@ do_one_click_all_with_cdn() {
   echo ""
   cyan "--- Cloudflare API Token (全局) ---"
   if [[ "$cf_proxy" == "0" ]]; then
-    echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS 灰云 A 记录"
+    echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的橙云 DNS/Origin Rules"
   else
     echo "此 Token 将用于: Argo 隧道配置 + CDN+VMess+WS 的 DNS/Origin Rules"
   fi
@@ -5762,6 +5851,11 @@ do_one_click_all_with_cdn() {
     fi
     _used_ports+=("$_port_val")
   done
+  if [[ "$cf_proxy" == "0" ]]; then
+    echo ""
+    cyan "--- CDN+VMess+WS 端口配置 ---"
+    configure_cdn_vmess_proxy_ports "$saved_cdn_vmess_client_port" "$saved_cdn_vmess_origin_port" "$saved_cdn_vmess_port" || return 1
+  fi
 
   # ===== 第5步: 节点名前缀 =====
   echo ""
@@ -5827,7 +5921,8 @@ do_one_click_all_with_cdn() {
   echo ""
   local cdn_need_origin_rule="0"
   if [[ "$cf_proxy" == "0" ]]; then
-    echo "灰云直连版使用自定义端口 ${CDN_VMESS_PORT}，无需 CF 标准端口或 Origin Rules。"
+    cdn_need_origin_rule="$(cdn_vmess_origin_rule_flag)"
+    echo "橙云 CDN 模式: 客户端 ${cdn_domain_input}:$(cdn_vmess_client_port) -> CF -> VPS:$(cdn_vmess_origin_port) -> 本机:${CDN_VMESS_PORT}"
   else
     echo "CDN 端口模式:"
     echo "  A) CF 标准 HTTP 端口 (无需 Origin Rules)"
@@ -5914,8 +6009,13 @@ do_one_click_all_with_cdn() {
   CDN_VMESS_UUID="${UUID}"
   CDN_VMESS_CDN_DOMAIN="$cdn_domain_input"
   CDN_VMESS_SERVER_ADDR="${vps_ip}"
-  CDN_VMESS_ORIGIN_PORT="$CDN_VMESS_PORT"
-  CDN_VMESS_CF_PROXY="$cf_proxy"
+  CDN_VMESS_ORIGIN_PORT="${CDN_VMESS_ORIGIN_PORT:-$CDN_VMESS_PORT}"
+  if [[ "$cf_proxy" == "0" ]]; then
+    CDN_VMESS_CF_PROXY="1"
+    CDN_VMESS_VIA_NGINX="1"
+  else
+    CDN_VMESS_CF_PROXY="$cf_proxy"
+  fi
 
   # 生成 VLESS Reality 密钥对
   echo "正在生成 sing-box VLESS Reality 密钥对..."
@@ -5931,7 +6031,7 @@ do_one_click_all_with_cdn() {
   else
     echo "正在配置 CDN+VMess+WS 的 Cloudflare 灰云 DNS..."
   fi
-  if ! cf_configure_cdn_vmess "$cdn_domain_input" "$CDN_VMESS_PORT" "$vps_ip" "$cdn_need_origin_rule" "$CDN_VMESS_CF_PROXY"; then
+  if ! cf_configure_cdn_vmess "$cdn_domain_input" "$(cdn_vmess_origin_port)" "$vps_ip" "$(cdn_vmess_origin_rule_flag)" "$CDN_VMESS_CF_PROXY"; then
     yellow "CDN-VMess DNS 配置失败，跳过 CDN+VMess+WS 节点。"
     CDN_VMESS_ENABLED="0"
   fi
@@ -5940,7 +6040,7 @@ do_one_click_all_with_cdn() {
   echo "正在写入主配置并拉起核心代理服务..."
   write_sing_box_config || return 1
 
-  if [[ "${VMESS_VIA_NGINX:-0}" == "1" ]]; then
+  if [[ "${VMESS_VIA_NGINX:-0}" == "1" || "${CDN_VMESS_VIA_NGINX:-0}" == "1" ]]; then
     echo "正在刷新 nginx 站点代理路径..."
     save_state
     refresh_mask_site_nginx || { red "nginx 代理路径刷新失败。"; return 1; }
@@ -6026,7 +6126,7 @@ create_node_submenu() {
     echo "  1) 一键生成所有标准协议 (VLESS/HY2/VMess/TUIC/AnyTLS/Argo)"
     echo "  2) 单独安装 CDN+VMess+WS 节点 (Cloudflare CDN 加速)"
     echo "  3) 一键全协议+CDN 黄云版 (VLESS/HY2/SS/VMess/TUIC/AnyTLS/Argo/CDN)"
-    echo "  4) 一键全协议+CDN 灰云直连版 (CDN 端口不受 CF 标准端口限制)"
+    echo "  4) 一键全协议+CDN 橙云回源443版 (便于替换 CF 优选 IP/域名)"
     echo "  5) Create CF proxy node"
     echo "  0) 返回主菜单"
     cyan "================================================="
@@ -6056,7 +6156,7 @@ create_node_submenu() {
         ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
-          red "一键全协议+CDN 灰云直连版安装失败。"
+          red "一键全协议+CDN 橙云回源443版安装失败。"
           echo "按回车键返回..."
           read -r
         fi
@@ -6113,7 +6213,7 @@ main_menu() {
     echo "  1  安装 sing-box"
     echo "  2  装站点且 nginx 代理"
     echo "  3) 创建代理节点"
-    echo "  4) 一键全协议+CDN 灰云直连版 (不开黄云，CDN 端口不受 CF 标准端口限制)"
+    echo "  4) 一键全协议+CDN 橙云回源443版 (便于替换 CF 优选 IP/域名)"
     echo "  5) 一键全协议+CDN 黄云代理版 (开黄云，使用 Cloudflare 边缘证书)"
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
@@ -6147,7 +6247,7 @@ main_menu() {
         ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
-          red "一键全协议+CDN 灰云直连版安装失败。"
+          red "一键全协议+CDN 橙云回源443版安装失败。"
           echo "按回车键返回主菜单..."
           read -r
         fi

@@ -33,7 +33,7 @@ load_state() {
     [[ -z "$k" || "$k" == "#"* ]] && continue
     [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case "$k" in
-      SITE_DOMAIN|SITE_TEMPLATE|SITE_ROOT|NGINX_SITE_CONF|DOMAIN|SNI_VAL|SELF_SIGN_CERT|VMESS_VIA_NGINX|VMESS_WS_PATH|VMESS_PORT)
+      SITE_DOMAIN|SITE_TEMPLATE|SITE_ROOT|NGINX_SITE_CONF|DOMAIN|SNI_VAL|SELF_SIGN_CERT|VMESS_VIA_NGINX|VMESS_WS_PATH|VMESS_PORT|CDN_VMESS_VIA_NGINX|CDN_VMESS_CDN_DOMAIN|CDN_VMESS_WS_PATH|CDN_VMESS_PORT)
         declare -g "${k}=${v}"
         ;;
     esac
@@ -341,13 +341,15 @@ HOOK
 }
 
 write_http_nginx_config() {
+  local server_names
+  server_names="$(nginx_server_names)"
   mkdir -p "$(dirname "$NGINX_SITE_CONF")" "$SITE_ROOT"
   cat > "$NGINX_SITE_CONF" <<NGINX
 # Managed by AGSB mask-site.sh. Existing nginx sites are not modified.
 server {
     listen 80;
     listen [::]:80;
-    server_name ${SITE_DOMAIN};
+    server_name ${server_names};
 
     root ${SITE_ROOT};
     index index.html;
@@ -366,12 +368,34 @@ server {
 NGINX
 }
 
+nginx_server_names() {
+  local names="${SITE_DOMAIN}"
+  if [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" && -n "${CDN_VMESS_CDN_DOMAIN:-}" && "${CDN_VMESS_CDN_DOMAIN}" != "${SITE_DOMAIN}" ]]; then
+    names="${names} ${CDN_VMESS_CDN_DOMAIN}"
+  fi
+  printf '%s\n' "$names"
+}
+
 write_https_nginx_config() {
-  local vmess_block=""
+  local vmess_block="" cdn_vmess_block="" server_names
+  server_names="$(nginx_server_names)"
   if [[ "${VMESS_VIA_NGINX:-0}" == "1" && -n "${VMESS_WS_PATH:-}" && -n "${VMESS_PORT:-}" ]]; then
     vmess_block="
     location ${VMESS_WS_PATH} {
         proxy_pass http://127.0.0.1:${VMESS_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_read_timeout 300s;
+    }
+"
+  fi
+  if [[ "${CDN_VMESS_VIA_NGINX:-0}" == "1" && -n "${CDN_VMESS_WS_PATH:-}" && -n "${CDN_VMESS_PORT:-}" ]]; then
+    cdn_vmess_block="
+    location ${CDN_VMESS_WS_PATH} {
+        proxy_pass http://127.0.0.1:${CDN_VMESS_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -388,7 +412,7 @@ write_https_nginx_config() {
 server {
     listen 80;
     listen [::]:80;
-    server_name ${SITE_DOMAIN};
+    server_name ${server_names};
 
     root ${SITE_ROOT};
 
@@ -405,7 +429,7 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name ${SITE_DOMAIN};
+    server_name ${server_names};
 
     ssl_certificate ${SSL_DIR}/fullchain.cer;
     ssl_certificate_key ${SSL_DIR}/private.key;
@@ -420,6 +444,7 @@ server {
     location = /docs { try_files /docs.html =404; }
     location = /status { try_files /status.html =404; }
 ${vmess_block}
+${cdn_vmess_block}
     location / { try_files \$uri \$uri/ /index.html; }
 }
 NGINX
