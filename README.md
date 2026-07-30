@@ -24,8 +24,32 @@
 
 ## 快速开始
 
+若提示 `curl: command not found`，先安装 curl（Debian / Ubuntu）：
+
+```bash
+apt update && apt install -y curl
+```
+
+其他发行版示例：
+
+```bash
+# CentOS / RHEL / Fedora
+dnf install -y curl   # 或: yum install -y curl
+
+# Alpine
+apk add --no-cache curl
+```
+
+一键运行：
+
 ```bash
 bash <(curl -fsSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/node.sh?t=$RANDOM")
+```
+
+没有 curl、只有 wget 时：
+
+```bash
+bash <(wget -qO- --header="Cache-Control: no-cache" "https://raw.githubusercontent.com/wuyou18075/node/refs/heads/main/node.sh")
 ```
 
 或克隆后本地运行：
@@ -169,6 +193,7 @@ Apache License 2.0。
 
 - Linux（systemd 发行版体验最佳；包管理支持 apt / dnf / yum 等）
 - root 权限
+- 拉脚本前本机需有 `curl` 或 `wget`（例如：`apt update && apt install -y curl`）
 - 常用依赖：`curl`、`jq`、`nginx`（伪装站/订阅）、`python3`（测速页）、`cloudflared`（Argo/隧道，可由脚本安装）
 - 使用 Cloudflare 相关功能时需有效 API Token 与对应 Zone 权限
 
