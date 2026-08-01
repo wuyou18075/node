@@ -6169,17 +6169,10 @@ do_one_click_all_with_cdn() {
   echo ""
   echo "本次安装将包含以下 5 个需要端口的协议:"
   echo "1.Hysteria2 2.VMess 3.TUIC 4.AnyTLS 5.VLESS"
+  read -r -p "请依次输入 5 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
 
-  VMESS_DIRECT_443="0"
-  local _used_ports=() _p _proto custom_ports port_array port_mode_choice
-
-  if [[ "$no_cf_mode" == "1" ]]; then
-    cyan "请选择端口方案："
-    echo "  1) 任意端口 + nginx 反代（随机 50000-60000，VMess-WS 经 nginx 443 反代）[默认]"
-    echo "  2) 直接 443（VMess 直接监听 443，不经 nginx；其余协议随机端口）"
-    read -r -p "请选择 [1/2，默认 1]: " port_mode_choice
-    port_mode_choice="${port_mode_choice:-1}"
-
+  if [[ -z "$custom_ports" ]]; then
+    local _used_ports=() _p
     for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
@@ -6194,57 +6187,20 @@ do_one_click_all_with_cdn() {
         VLESS) VLESS_PORT="$_p" ;;
       esac
     done
-
-    if [[ "$port_mode_choice" == "2" ]]; then
-      VMESS_PORT="443"
-      VMESS_DIRECT_443="1"
-      VMESS_VIA_NGINX="0"
-      if [[ "${SITE_ENABLED:-0}" == "1" ]]; then
-        yellow "注意：伪装站 nginx 已占用 443，VMess 直接 443 将与 nginx 冲突；建议改为方案 1 或不部署伪装站。"
-      fi
-      echo "已选择直接 443: VMess=$VMESS_PORT HY2=$HY2_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
-    else
-      echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
-    fi
+    echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
   else
-    read -r -p "请依次输入 5 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
-
-    if [[ -z "$custom_ports" ]]; then
-      for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
-        while :; do
-          _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
-          [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
-        done
-        _used_ports+=("$_p")
-        case "$_proto" in
-          HY2) HY2_PORT="$_p" ;;
-          VMESS) VMESS_PORT="$_p" ;;
-          TUIC) TUIC_PORT="$_p" ;;
-          ANYTLS) ANYTLS_PORT="$_p" ;;
-          VLESS) VLESS_PORT="$_p" ;;
-        esac
-      done
-      echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
-    else
-      IFS=',' read -r -a port_array <<< "$custom_ports"
-      HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-      VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-      TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-      ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-      VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    fi
+    IFS=',' read -r -a port_array <<< "$custom_ports"
+    HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
   fi
 
   # 端口去重和冲突检测
-  _used_ports=()
-  local _port_var _port_val _new_port
+  local _used_ports=() _port_var _port_val _new_port
   for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT; do
     _port_val="${!_port_var:-}"
-    # 直接 443 模式下，VMess 固定占用 443，跳过冲突重分配
-    if [[ "$_port_var" == "VMESS_PORT" && "${VMESS_DIRECT_443:-0}" == "1" ]]; then
-      _used_ports+=("$_port_val")
-      continue
-    fi
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
       printf -v "$_port_var" '%s' "$_new_port"
@@ -6394,9 +6350,7 @@ do_one_click_all_with_cdn() {
   [[ -n "${VMESS_WS_PATH:-}" ]] || VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
   [[ -n "${CDN_VMESS_WS_PATH:-}" ]] || CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
 
-  if [[ "${VMESS_DIRECT_443:-0}" == "1" ]]; then
-    VMESS_VIA_NGINX="0"
-  elif [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
+  if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
     VMESS_VIA_NGINX="1"
   else
     VMESS_VIA_NGINX="0"
