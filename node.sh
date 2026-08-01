@@ -291,7 +291,8 @@ tls_skip_verify_bool() {
 disable_legacy_protocol_services() { :; }
 sing_box_has_enabled_inbound() {
   has_vless_install || has_hy2_install || has_anytls_install || has_ss2022_install || \
-    has_vmess_install || has_tuic_install || has_argo_install || has_cdn_vmess_install
+    has_vmess_install || has_tuic_install || has_argo_install || has_cdn_vmess_install || \
+    has_socks5_install
 }
 ensure_dual_stack_ipv6_bind() {
   sysctl -w net.ipv6.bindv6only=0 >/dev/null 2>&1 || true
@@ -2391,6 +2392,9 @@ write_sing_box_config() {
   ensure_node_info_dir
   tmp_cfg="$(mktemp)"
 
+  local socks5_inbounds
+  socks5_inbounds="$(socks5_inbounds_json "$public_listen")"
+
   # 最终兜底：在生成配置前验证 anytls 是否可用
   if [[ "${ANYTLS_ENABLED:-0}" == "1" ]]; then
     local _atf="$(mktemp)"
@@ -2448,6 +2452,7 @@ write_sing_box_config() {
     --arg cdn_vmess_uuid "${CDN_VMESS_UUID:-}" \
     --arg cdn_vmess_ws_path "${CDN_VMESS_WS_PATH:-}" \
     --arg cdn_vmess_listen "$cdn_vmess_listen" \
+    --argjson socks5_inbounds "$socks5_inbounds" \
     --arg public_listen "$public_listen" '
 [
   (if $uuid != "" and $private_key != "" and $public_key != "" and $short_id != "" then
@@ -2634,7 +2639,8 @@ write_sing_box_config() {
         "enabled": false
       }
     }
-  else empty end)
+  else empty end),
+  ($socks5_inbounds | .[])
 ] as $inbounds
 | if ($inbounds | length) == 0 then
     error("no sing-box inbounds enabled")
@@ -6545,6 +6551,297 @@ do_one_click_all_basic_without_cf() {
   do_one_click_all_with_cdn 0 no_cf
 }
 
+# =============================================================================
+# SOCKS5 管理（带账密，多端口，持久化到 socks5-list.json）
+# =============================================================================
+SOCKS5_LIST_FILE="${STATE_DIR}/socks5-list.json"
+
+socks5_load_list() {
+  [[ -f "$SOCKS5_LIST_FILE" ]] || { printf '%s\n' "[]"; return; }
+  cat "$SOCKS5_LIST_FILE"
+}
+
+socks5_save_list() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$1" > "$SOCKS5_LIST_FILE"
+}
+
+has_socks5_install() {
+  [[ -f "$SOCKS5_LIST_FILE" ]] || return 1
+  local n
+  n="$(jq 'length' "$SOCKS5_LIST_FILE" 2>/dev/null || echo 0)"
+  [[ "$n" -gt 0 ]]
+}
+
+# 生成 sing-box socks 入站 JSON 数组，供 write_sing_box_config 注入
+socks5_inbounds_json() {
+  local listen="${1:-::}"
+  if [[ ! -f "$SOCKS5_LIST_FILE" ]]; then printf '%s\n' "[]"; return; fi
+  jq -c --arg listen "$listen" \
+    'map({"type":"socks","tag":.tag,"listen":$listen,"listen_port":.port,"users":[{"name":.user,"username":.user,"password":.pass}]})' \
+    "$SOCKS5_LIST_FILE" 2>/dev/null || printf '%s\n' "[]"
+}
+
+socks5_next_tag() {
+  local n
+  n="$(socks5_load_list | jq 'length' 2>/dev/null || echo 0)"
+  printf 'socks5-in-%s\n' "$((n+1))"
+}
+
+socks5_add() {
+  require_root || return 1
+  command -v jq >/dev/null 2>&1 || { install_packages jq || { red "缺少 jq"; return 1; }; }
+
+  local port user pass tag list newlist
+  read -r -p "输入 SOCKS5 端口(留空随机 50000-60000): " port
+  if [[ -z "$port" ]]; then
+    port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+  elif [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+    red "端口无效"; return 1
+  fi
+  if port_in_use "$port"; then
+    red "端口 ${port} 已被占用"; return 1
+  fi
+  read -r -p "输入用户名: " user
+  [[ -n "$user" ]] || { red "用户名不能为空"; return 1; }
+  read -r -p "输入密码(留空自动生成): " pass
+  [[ -n "$pass" ]] || pass="$(openssl rand -base64 12 | tr -d '/+=' | cut -c1-16)"
+
+  install_sing_box >/dev/null 2>&1 || { red "sing-box 未就绪"; return 1; }
+
+  tag="$(socks5_next_tag)"
+  list="$(socks5_load_list)"
+  newlist="$(printf '%s' "$list" | jq -c --arg tag "$tag" --argjson port "$port" --arg user "$user" --arg pass "$pass" \
+    '. + [{"tag":$tag,"port":$port,"user":$user,"pass":$pass}]')"
+
+  socks5_save_list "$newlist"
+  if ! write_sing_box_config; then
+    red "配置写入失败，已回滚。"
+    socks5_save_list "$list"
+    return 1
+  fi
+  green "SOCKS5 已新增: 端口 ${port} 用户 ${user}"
+  echo "  连接: socks5://${user}:***@$(preferred_direct_server_addr || echo 127.0.0.1):${port}"
+}
+
+socks5_list() {
+  if ! has_socks5_install; then
+    yellow "当前没有 SOCKS5 入站。"
+    return
+  fi
+  local host
+  host="$(preferred_direct_server_addr 2>/dev/null || echo 服务器IP)"
+  echo ""
+  printf "%-4s %-14s %-10s %-16s %s\n" "序号" "标签" "端口" "用户名" "连接"
+  printf -- "---- -------------- ---------- ---------------- ---------------------\n"
+  socks5_load_list | jq -r --arg host "$host" \
+    'to_entries[] | "\(.key+1)\t\(.value.tag)\t\(.value.port)\t\(.value.user)\tsocks5://\(.value.user):***@\($host):\(.value.port)"' \
+    | awk -F'\t' '{printf "%-4s %-14s %-10s %-16s %s\n",$1,$2,$3,$4,$5}'
+  echo ""
+}
+
+socks5_delete() {
+  if ! has_socks5_install; then
+    yellow "当前没有 SOCKS5 入站。"
+    return 1
+  fi
+  socks5_list
+  local raw idx n list newlist
+  read -r -p "输入要删除的序号: " raw
+  [[ "$raw" =~ ^[0-9]+$ ]] || { yellow "已取消"; return; }
+  n="$(socks5_load_list | jq 'length')"
+  idx=$(( raw - 1 ))
+  if (( idx < 0 || idx >= n )); then
+    red "无效序号"; return 1
+  fi
+  list="$(socks5_load_list)"
+  newlist="$(printf '%s' "$list" | jq -c --argjson i "$idx" 'del(.[$i])')"
+  socks5_save_list "$newlist"
+  if sing_box_has_enabled_inbound; then
+    if ! write_sing_box_config; then
+      red "配置写入失败，已回滚。"
+      socks5_save_list "$list"
+      return 1
+    fi
+  else
+    systemctl disable --now "$SING_BOX_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$SING_BOX_CFG"
+  fi
+  green "已删除序号 ${raw}。"
+}
+
+socks5_menu() {
+  while true; do
+    clear
+    cyan "=================== SOCKS5 管理 ==================="
+    socks5_list
+    echo "  1) 新增 SOCKS5(端口+账密)"
+    echo "  2) 查看列表"
+    echo "  3) 删除"
+    echo "  0) 返回主菜单"
+    read -r -p "请选择: " sc
+    case "$sc" in
+      1) socks5_add ;;
+      2) socks5_list ;;
+      3) socks5_delete ;;
+      0) return 0 ;;
+      *) red "无效输入" ;;
+    esac
+    echo "按回车键继续..."
+    read -r
+  done
+}
+
+# =============================================================================
+# 流量统计(vnstat)：重启不丢、每月自动滚动
+# =============================================================================
+TRAFFIC_LIMIT_FILE="${STATE_DIR}/traffic-limit"
+
+vnstat_default_iface() {
+  ip route show default 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+human_bytes() {
+  local b="${1:-0}" i=0
+  local units=("B" "KB" "MB" "GB" "TB" "PB")
+  while (( b > 1024 && i < ${#units[@]}-1 )); do
+    b=$((b/1024)); i=$((i+1))
+  done
+  awk -v b="$b" -v u="${units[$i]}" 'BEGIN{printf "%.1f %s", b, u}'
+}
+
+# 输出当前月 "rx tx"(字节)，失败为空
+vnstat_month_rx_tx() {
+  local iface
+  iface="$(vnstat_default_iface)"
+  [[ -n "$iface" ]] || return 1
+  command -v vnstat >/dev/null 2>&1 || return 1
+  vnstat --json m -i "$iface" 2>/dev/null | jq -r \
+    '.interfaces[0].traffic.months[-1] | "\(.rx) \(.tx)"' 2>/dev/null
+}
+
+traffic_limit_get() {
+  [[ -f "$TRAFFIC_LIMIT_FILE" ]] && cat "$TRAFFIC_LIMIT_FILE" 2>/dev/null || printf '0\n'
+}
+
+traffic_install_stats() {
+  require_root || return 1
+  yellow "正在安装 vnstat..."
+  install_packages vnstat || { red "vnstat 安装失败"; return 1; }
+  local iface
+  iface="$(vnstat_default_iface)"
+  [[ -n "$iface" ]] || { red "未能识别默认网卡"; return 1; }
+  if [[ -f /etc/vnstat.conf ]]; then
+    sed -i "s|^Interface .*|Interface \"$iface\"|" /etc/vnstat.conf 2>/dev/null || true
+  fi
+  systemctl enable --now vnstat >/dev/null 2>&1 || systemctl restart vnstat >/dev/null 2>&1 || true
+  green "vnstat 已安装并启动，监控网卡: ${iface}"
+  echo "统计由 vnstat 持久化，重启/关机后保留，每月自动滚动。"
+}
+
+traffic_view() {
+  if ! command -v vnstat >/dev/null 2>&1; then
+    red "未安装 vnstat，请先执行「安装流量统计」。"
+    return 1
+  fi
+  local iface rx_tx rx tx limit
+  iface="$(vnstat_default_iface)"
+  [[ -n "$iface" ]] || { red "未能识别默认网卡"; return 1; }
+  echo ""
+  cyan "网卡 ${iface} 流量(月度):"
+  if rx_tx="$(vnstat_month_rx_tx)" && [[ -n "$rx_tx" ]]; then
+    rx="${rx_tx% *}"; tx="${rx_tx#* }"
+    echo "  入站(rx/下载): $(human_bytes "$rx")"
+    echo "  出站(tx/上传): $(human_bytes "$tx")"
+    echo "  合计: $(human_bytes "$((rx+tx))")"
+  else
+    yellow "  vnstat 尚无足够数据，请稍后再查。"
+  fi
+  limit="$(traffic_limit_get)"
+  if [[ -n "$limit" && "$limit" != "0" ]]; then
+    if [[ -n "${rx:-}${tx:-}" ]]; then
+      local used_mb
+      used_mb=$(( (rx+tx)/1024/1024 ))
+      echo "  流量上限: ${limit} MB (已用约 ${used_mb} MB)"
+    else
+      echo "  流量上限: ${limit} MB"
+    fi
+  else
+    echo "  流量上限: 不限(0)"
+  fi
+  echo ""
+  echo "—— vnstat 原始输出 ——"
+  vnstat -i "$iface" 2>/dev/null | head -25 || true
+}
+
+traffic_set_limit() {
+  local limit cur
+  cur="$(traffic_limit_get)"
+  echo "当前: ${cur} MB (0=不限)"
+  read -r -p "输入流量上限(MB, 0=不限): " limit
+  [[ "$limit" =~ ^[0-9]+$ ]] || { red "无效数字"; return 1; }
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$limit" > "$TRAFFIC_LIMIT_FILE"
+  if [[ "$limit" == "0" ]]; then
+    green "流量上限已设置为: 不限(0)"
+  else
+    green "流量上限已设置为: ${limit} MB"
+  fi
+}
+
+traffic_menu() {
+  while true; do
+    clear
+    cyan "=================== 流量管理 ==================="
+    echo "  1) 安装流量统计(vnstat)"
+    echo "  2) 查看流量(入站/出站)"
+    echo "  3) 设置流量总量(0=不限)"
+    echo "  0) 返回主菜单"
+    read -r -p "请选择: " tc
+    case "$tc" in
+      1) traffic_install_stats ;;
+      2) traffic_view ;;
+      3) traffic_set_limit ;;
+      0) return 0 ;;
+      *) red "无效输入" ;;
+    esac
+    echo "按回车键继续..."
+    read -r
+  done
+}
+
+# 面板头部扩展：nginx 状态 / 伪装站地址 / 入站出站流量
+print_panel_extras() {
+  local nginx_status
+  if [[ -x /usr/sbin/nginx ]] || command -v nginx >/dev/null 2>&1; then
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      nginx_status="$(green "运行中")"
+    else
+      nginx_status="$(yellow "已停")"
+    fi
+  else
+    nginx_status="$(yellow "未安装")"
+  fi
+
+  local mask_addr="无"
+  load_state >/dev/null 2>&1 || true
+  if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" ]]; then
+    mask_addr="https://${SITE_DOMAIN}/"
+  fi
+  echo "   nginx: ${nginx_status}   伪装站: ${mask_addr}"
+
+  local rx_tx="" rx tx
+  if command -v vnstat >/dev/null 2>&1 && systemctl is-active --quiet vnstat 2>/dev/null; then
+    rx_tx="$(vnstat_month_rx_tx 2>/dev/null || true)"
+  fi
+  if [[ -n "$rx_tx" ]]; then
+    rx="${rx_tx% *}"; tx="${rx_tx#* }"
+    echo "   入站: $(human_bytes "$rx")   出站: $(human_bytes "$tx")"
+  else
+    echo "   入站: 未开启(vnstat)   出站: 未开启(vnstat)"
+  fi
+}
+
 main_menu() {
   while true; do
     load_state >/dev/null 2>&1 || true
@@ -6556,14 +6853,17 @@ main_menu() {
 
     show_node_config_path
     print_sing_box_panel_status
+    print_panel_extras
     echo ""
     echo "  1  安装 sing-box"
     echo "  2) 基础协议(无cf版)"
+    echo "  3) 流量管理"
     echo "  4) 全协议cf灰云+橙云+argo+cdn"
     echo "  5) Cloudflare 橙云 DNS + 边缘证书"
     echo "  6) 应用系统网络加速"
     echo "  7) 查看所有节点"
     echo "  8) 节点订阅链接"
+    echo "  9) SOCKS5 管理"
     echo "  90 配置文件管理"
     echo "  97 装站点且 nginx 代理"
     echo "  98 更新sing-box 版本"
@@ -6589,6 +6889,9 @@ main_menu() {
         fi
         echo "按回车键返回主菜单..."
         read -r
+        ;;
+      3)
+        traffic_menu
         ;;
       4)
         if ! do_one_click_all_with_direct_cdn; then
@@ -6618,6 +6921,9 @@ main_menu() {
         fi
         echo "按回车键返回主菜单..."
         read -r
+        ;;
+      9)
+        socks5_menu
         ;;
       90)
         manage_node_config_menu
