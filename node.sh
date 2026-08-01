@@ -6621,7 +6621,7 @@ socks5_add() {
     return 1
   fi
   green "SOCKS5 已新增: 端口 ${port} 用户 ${user}"
-  echo "  连接: socks5://${user}:***@$(preferred_direct_server_addr || echo 127.0.0.1):${port}"
+  echo "  连接: socks5://${user}:${pass}@$(preferred_direct_server_addr || echo 127.0.0.1):${port}"
 }
 
 socks5_list() {
@@ -6635,7 +6635,7 @@ socks5_list() {
   printf "%-4s %-14s %-10s %-16s %s\n" "序号" "标签" "端口" "用户名" "连接"
   printf -- "---- -------------- ---------- ---------------- ---------------------\n"
   socks5_load_list | jq -r --arg host "$host" \
-    'to_entries[] | "\(.key+1)\t\(.value.tag)\t\(.value.port)\t\(.value.user)\tsocks5://\(.value.user):***@\($host):\(.value.port)"' \
+    'to_entries[] | "\(.key+1)\t\(.value.tag)\t\(.value.port)\t\(.value.user)\tsocks5://\(.value.user):\(.value.pass)@\($host):\(.value.port)"' \
     | awk -F'\t' '{printf "%-4s %-14s %-10s %-16s %s\n",$1,$2,$3,$4,$5}'
   echo ""
 }
