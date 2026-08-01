@@ -6702,12 +6702,13 @@ vnstat_default_iface() {
 }
 
 human_bytes() {
-  local b="${1:-0}" i=0
-  local units=("B" "KB" "MB" "GB" "TB" "PB")
-  while (( b > 1024 && i < ${#units[@]}-1 )); do
-    b=$((b/1024)); i=$((i+1))
-  done
-  awk -v b="$b" -v u="${units[$i]}" 'BEGIN{printf "%.1f %s", b, u}'
+  local b="${1:-0}"
+  # 统一折算为 MB：< 1GB 显示 MB，≥ 1GB 显示 GB
+  awk -v b="$b" 'BEGIN{
+    mb = b / 1048576;
+    if (mb >= 1024) printf "%.1f GB", mb / 1024;
+    else printf "%.1f MB", mb
+  }'
 }
 
 # 输出当前月 "rx tx"(字节)，失败为空
