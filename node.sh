@@ -6578,7 +6578,7 @@ socks5_inbounds_json() {
   local listen="${1:-::}"
   if [[ ! -f "$SOCKS5_LIST_FILE" ]]; then printf '%s\n' "[]"; return; fi
   jq -c --arg listen "$listen" \
-    'map({"type":"socks","tag":.tag,"listen":$listen,"listen_port":.port,"users":[{"name":.user,"username":.user,"password":.pass}]})' \
+    'map({"type":"socks","tag":.tag,"listen":$listen,"listen_port":.port,"users":[{"username":.user,"password":.pass}]})' \
     "$SOCKS5_LIST_FILE" 2>/dev/null || printf '%s\n' "[]"
 }
 
