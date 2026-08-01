@@ -1774,6 +1774,54 @@ configure_domain_certificate_with_config() {
   fi
 }
 
+request_letsencrypt_standalone() {
+  local cert_domain="$1" nginx_was_running="0" rc live_dir hook
+  [[ -n "$cert_domain" ]] || { red "证书域名不能为空。"; return 1; }
+
+  if ! command -v certbot >/dev/null 2>&1; then
+    yellow "未检测到 certbot，正在安装..."
+    install_packages certbot || { red "certbot 安装失败。"; return 1; }
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx_was_running="1"
+    yellow "临时停止 nginx 以释放 80 端口供 certbot standalone 使用..."
+    systemctl stop nginx >/dev/null 2>&1 || true
+  fi
+
+  yellow "正在通过 certbot standalone 申请 ${cert_domain} 的 Let's Encrypt 证书..."
+  certbot certonly --standalone -d "$cert_domain" \
+    --agree-tos --register-unsafely-without-email --non-interactive
+  rc=$?
+
+  [[ "$nginx_was_running" == "1" ]] && systemctl start nginx >/dev/null 2>&1 || true
+
+  if [[ "$rc" -ne 0 ]]; then
+    red "证书申请失败。请检查 DNS 解析、80 端口是否放行以及 certbot 输出。"
+    return 1
+  fi
+
+  mkdir -p "$SSL_DIR"
+  live_dir="/etc/letsencrypt/live/${cert_domain}"
+  if [[ -f "${live_dir}/fullchain.pem" && -f "${live_dir}/privkey.pem" ]]; then
+    install -m 0644 "${live_dir}/fullchain.pem" "${SSL_DIR}/fullchain.cer"
+    install -m 0600 "${live_dir}/privkey.pem" "${SSL_DIR}/private.key"
+    hook="/etc/letsencrypt/renewal-hooks/deploy/agsb-copy-${cert_domain}.sh"
+    mkdir -p "$(dirname "$hook")"
+    cat > "$hook" <<EOF
+#!/usr/bin/env bash
+install -m 0644 "${live_dir}/fullchain.pem" "${SSL_DIR}/fullchain.cer"
+install -m 0600 "${live_dir}/privkey.pem" "${SSL_DIR}/private.key"
+EOF
+    chmod +x "$hook" 2>/dev/null || true
+    green "${cert_domain} 的 Let's Encrypt 证书已申请并同步到 ${SSL_DIR}。"
+    return 0
+  fi
+
+  red "证书申请成功，但未找到证书文件。"
+  return 1
+}
+
 configure_domain_certificate_without_cf() {
   local input_domain vps_ip
 
@@ -1799,7 +1847,6 @@ configure_domain_certificate_without_cf() {
 
   DOMAIN="$input_domain"
   SITE_DOMAIN="$DOMAIN"
-  SITE_ENABLED="1"
   SNI_VAL="$DOMAIN"
   REALITY_SNI="$DOMAIN"
   SELF_SIGN_CERT="0"
@@ -1808,16 +1855,15 @@ configure_domain_certificate_without_cf() {
   if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
     echo "检测到服务器已存在匹配 ${DOMAIN} 的可用证书，将直接使用。"
     save_state
-    install_mask_site_nginx || return 1
     return 0
   fi
 
-  yellow "将通过本机 nginx + Let's Encrypt 为 ${DOMAIN} 申请证书。"
-  yellow "请确认域名 A/AAAA 记录已指向本机，并且 TCP 80/443 已放行。"
+  yellow "将通过 certbot standalone 为 ${DOMAIN} 申请 Let's Encrypt 证书。"
+  yellow "请确认域名 A/AAAA 记录已指向本机，并且 TCP 80 已放行。"
   vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
   [[ -n "$vps_ip" ]] && SITE_VPS_IP="$vps_ip"
   save_state
-  install_mask_site_nginx || return 1
+  request_letsencrypt_standalone "$DOMAIN" || return 1
   if cert_files_exist && cert_matches_domain && cert_is_currently_valid && cert_is_client_trusted "$DOMAIN"; then
     SELF_SIGN_CERT="0"
     echo "证书已申请并同步到 ${SSL_DIR}。"
@@ -6098,14 +6144,42 @@ do_one_click_all_with_cdn() {
     fi
   fi
 
+  # ===== (仅无 CF 模式) 伪装站部署选择 =====
+  if [[ "$no_cf_mode" == "1" && -n "${DOMAIN:-}" && "${SELF_SIGN_CERT:-0}" != "1" ]]; then
+    echo ""
+    cyan "--- 伪装站部署 ---"
+    echo "部署伪装站后 nginx 将占用 443 并可反代 VMess-WS；不部署则可让 VMess 直接监听 443。"
+    local deploy_mask="n"
+    if [[ "${SITE_ENABLED:-0}" == "1" ]]; then
+      read -r -p "检测到已有伪装站，是否重新部署/选择模板? [y/N]: " deploy_mask
+    else
+      read -r -p "是否部署静态伪装站? [y/N]: " deploy_mask
+    fi
+    if [[ "$deploy_mask" =~ ^[Yy]$ ]]; then
+      save_state
+      install_mask_site_nginx || return 1
+    else
+      SITE_ENABLED="0"
+      save_state >/dev/null 2>&1 || true
+      yellow "跳过伪装站部署。"
+    fi
+  fi
+
   # ===== 第4步: 端口分配（5个直连协议: HY2/VMess/TUIC/AnyTLS/VLESS；CDN-VMess 后续单独配置） =====
   echo ""
   echo "本次安装将包含以下 5 个需要端口的协议:"
   echo "1.Hysteria2 2.VMess 3.TUIC 4.AnyTLS 5.VLESS"
-  read -r -p "请依次输入 5 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
 
-  if [[ -z "$custom_ports" ]]; then
-    local _used_ports=() _p
+  VMESS_DIRECT_443="0"
+  local _used_ports=() _p _proto custom_ports port_array port_mode_choice
+
+  if [[ "$no_cf_mode" == "1" ]]; then
+    cyan "请选择端口方案："
+    echo "  1) 任意端口 + nginx 反代（随机 50000-60000，VMess-WS 经 nginx 443 反代）[默认]"
+    echo "  2) 直接 443（VMess 直接监听 443，不经 nginx；其余协议随机端口）"
+    read -r -p "请选择 [1/2，默认 1]: " port_mode_choice
+    port_mode_choice="${port_mode_choice:-1}"
+
     for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
       while :; do
         _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
@@ -6120,20 +6194,57 @@ do_one_click_all_with_cdn() {
         VLESS) VLESS_PORT="$_p" ;;
       esac
     done
-    echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
+
+    if [[ "$port_mode_choice" == "2" ]]; then
+      VMESS_PORT="443"
+      VMESS_DIRECT_443="1"
+      VMESS_VIA_NGINX="0"
+      if [[ "${SITE_ENABLED:-0}" == "1" ]]; then
+        yellow "注意：伪装站 nginx 已占用 443，VMess 直接 443 将与 nginx 冲突；建议改为方案 1 或不部署伪装站。"
+      fi
+      echo "已选择直接 443: VMess=$VMESS_PORT HY2=$HY2_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
+    else
+      echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
+    fi
   else
-    IFS=',' read -r -a port_array <<< "$custom_ports"
-    HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
-    VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    read -r -p "请依次输入 5 个端口(逗号隔开)，留空全部随机 50000-60000: " custom_ports
+
+    if [[ -z "$custom_ports" ]]; then
+      for _proto in HY2 VMESS TUIC ANYTLS VLESS; do
+        while :; do
+          _p="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
+          [[ " ${_used_ports[*]} " != *" $_p "* ]] && break
+        done
+        _used_ports+=("$_p")
+        case "$_proto" in
+          HY2) HY2_PORT="$_p" ;;
+          VMESS) VMESS_PORT="$_p" ;;
+          TUIC) TUIC_PORT="$_p" ;;
+          ANYTLS) ANYTLS_PORT="$_p" ;;
+          VLESS) VLESS_PORT="$_p" ;;
+        esac
+      done
+      echo "已自动生成端口: HY2=$HY2_PORT VMess=$VMESS_PORT TUIC=$TUIC_PORT AnyTLS=$ANYTLS_PORT VLESS=$VLESS_PORT"
+    else
+      IFS=',' read -r -a port_array <<< "$custom_ports"
+      HY2_PORT="${port_array[0]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+      VMESS_PORT="${port_array[1]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+      TUIC_PORT="${port_array[2]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+      ANYTLS_PORT="${port_array[3]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+      VLESS_PORT="${port_array[4]:-$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)}"
+    fi
   fi
 
   # 端口去重和冲突检测
-  local _used_ports=() _port_var _port_val _new_port
+  _used_ports=()
+  local _port_var _port_val _new_port
   for _port_var in HY2_PORT VMESS_PORT TUIC_PORT ANYTLS_PORT VLESS_PORT; do
     _port_val="${!_port_var:-}"
+    # 直接 443 模式下，VMess 固定占用 443，跳过冲突重分配
+    if [[ "$_port_var" == "VMESS_PORT" && "${VMESS_DIRECT_443:-0}" == "1" ]]; then
+      _used_ports+=("$_port_val")
+      continue
+    fi
     if [[ ! "$_port_val" =~ ^[0-9]+$ || " ${_used_ports[*]} " == *" $_port_val "* ]] || port_in_use "$_port_val"; then
       _new_port="$(pick_free_port 50000 60000 || shuf -i 50000-60000 -n 1)"
       printf -v "$_port_var" '%s' "$_new_port"
@@ -6283,7 +6394,9 @@ do_one_click_all_with_cdn() {
   [[ -n "${VMESS_WS_PATH:-}" ]] || VMESS_WS_PATH="/ws-$(openssl rand -hex 8)"
   [[ -n "${CDN_VMESS_WS_PATH:-}" ]] || CDN_VMESS_WS_PATH="/cdn-ws-$(openssl rand -hex 6)"
 
-  if [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
+  if [[ "${VMESS_DIRECT_443:-0}" == "1" ]]; then
+    VMESS_VIA_NGINX="0"
+  elif [[ "${SITE_ENABLED:-0}" == "1" && -n "${SITE_DOMAIN:-}" && "${SITE_DOMAIN}" == "${DOMAIN}" && -f "$NGINX_SITE_CONF" && -f "$SSL_DIR/fullchain.cer" && -f "$SSL_DIR/private.key" ]]; then
     VMESS_VIA_NGINX="1"
   else
     VMESS_VIA_NGINX="0"
