@@ -6578,8 +6578,8 @@ main_menu() {
       99)
         echo ""
         red "警告：此操作将卸载 sing-box、所有节点配置、证书、缓存、订阅服务、脚本创建的伪装站和系统网络加速/优化配置！"
-        read -r -p "确认卸载? [y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        read -r -p "确认卸载? [Y/n]: " confirm
+        if [[ -n "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
           yellow "已取消卸载。"
         else
           if uninstall_all; then
