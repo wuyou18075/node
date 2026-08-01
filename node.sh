@@ -745,8 +745,7 @@ run_remote_mask_site_script() {
     if [[ -z "$vps_ip" ]]; then
       vps_ip="$(detect_public_ipv4 2>/dev/null || true)"
     fi
-    printf '\n' | \
-      SITE_DOMAIN="$auto_domain" DOMAIN="$auto_domain" SNI_VAL="${SNI_VAL:-$auto_domain}" \
+    SITE_DOMAIN="$auto_domain" DOMAIN="$auto_domain" SNI_VAL="${SNI_VAL:-$auto_domain}" \
       SELF_SIGN_CERT="${SELF_SIGN_CERT:-1}" USE_CF_ORIGIN_CA_CERT="${USE_CF_ORIGIN_CA_CERT:-0}" \
       CF_API_TOKEN="${CF_API_TOKEN:-}" SITE_VPS_IP="${SITE_VPS_IP:-$vps_ip}" \
       bash "$tmp_script" "$action"
